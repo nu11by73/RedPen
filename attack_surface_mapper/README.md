@@ -16,3 +16,20 @@ python main.py -d target.com -c "Company Name" -m asn,domains,certs
 
 # All modules (default)
 python main.py -d target.com -c "Company Name"
+
+
+# Cloudflare Check:
+# Feed it your ASM scan output directly
+python cf_check.py output\asm_target_20260410_123456.json
+
+# Or a text file of IPs (one per line)
+python cf_check.py ips.txt
+
+# Or a single domain
+python cf_check.py example.com
+
+# Or comma-separated IPs
+python cf_check.py 104.16.1.1,8.8.8.8,192.168.1.1
+
+# Export results to JSON
+python cf_check.py output\asm_target.json --export
