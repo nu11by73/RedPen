@@ -1,0 +1,18 @@
+﻿CONFIG = {
+    "SHODAN_API_KEY": "ch3B9acvBQSytoXxLC22hVtBfxSenqmX",
+    "VIRUSTOTAL_API_KEY": "1fed4afd6df5435727e7ee6b1e256e825fa8f68713db8f7fe0b4b64ee82ae83d",
+    "CENSYS_API_ID": "",
+    "CENSYS_API_SECRET": "",
+    "HUNTER_API_KEY": "75afd99f154c05aa593d247add3f31a55dbd8b51",
+    "GITHUB_TOKEN": "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",
+    "HIBP_API_KEY": "",
+    "BUILTWITH_API_KEY": "",
+    "SECURITYTRAILS_API_KEY": "",
+    "REQUEST_TIMEOUT": 15,
+    "REQUEST_DELAY": 1,
+    "MAX_SUBDOMAINS": 500,
+    "MAX_IPS_TO_SCAN": 50,
+    "THREADS": 10,
+    "OUTPUT_DIR": "./output",
+    "USER_AGENT": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+}
