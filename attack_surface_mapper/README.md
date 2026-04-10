@@ -1,7 +1,9 @@
 # Setup:
 pip install -r requirements.txt
+
 notepad config.py
 Add your API keys, save, close notepad
+Note: For the GitHub key it is a read-only, fine grained, token
 
 # Run Modes:
 # Single module
