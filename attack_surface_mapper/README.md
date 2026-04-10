@@ -33,3 +33,14 @@ python cf_check.py 104.16.1.1,8.8.8.8,192.168.1.1
 
 # Export results to JSON
 python cf_check.py output\asm_target.json --export
+
+
+API Endpoint Identification:
+# Run just the secret scanner
+python main.py -d target.com -m 10
+
+# Run with subdomain discovery first (recommended)
+python main.py -d target.com -m 2,10
+
+# Run everything including secrets
+python main.py -d target.com -c "Company Name"
