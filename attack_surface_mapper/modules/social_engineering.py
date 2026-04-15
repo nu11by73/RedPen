@@ -8,7 +8,7 @@ console = Console()
 class SocialEngineeringRecon:
     def __init__(self, config):
         self.config = config
-        self.results = {"email_addresses": [], "email_format": "", "employees": [], "data_breaches": [], "phishing_targets": [], "credential_leaks": [], "next_steps": [], "shadow_it_flags": []}
+        self.results = {"email_addresses": [], "email_format": "", "employees": [], "data_breaches": [], "phishing_targets": [], "credential_leaks": [], "subdomains": [], "next_steps": [], "shadow_it_flags": []}
 
     def run(self, target_domain, company_name=None):
         console.print(f"\n[bold cyan]{'='*60}[/bold cyan]")
@@ -21,22 +21,85 @@ class SocialEngineeringRecon:
         return self.results
 
     def _hunter(self, domain):
-        console.print("[yellow][*] Hunter.io email search...[/yellow]")
-        api_key = self.config.get("HUNTER_API_KEY", "")
-        if not api_key:
-            console.print("  [red][-] Hunter.io API key not set.[/red]")
-            return
-        try:
-            resp = requests.get(f"https://api.hunter.io/v2/domain-search?domain={domain}&api_key={api_key}&limit=100", timeout=15)
-            if resp.status_code == 200:
-                data = resp.json().get("data", {})
-                self.results["email_format"] = data.get("pattern", "Unknown")
-                for e in data.get("emails", []):
-                    self.results["email_addresses"].append({"email": e.get("value", ""), "type": e.get("type", ""), "confidence": e.get("confidence", 0), "first_name": e.get("first_name", ""), "last_name": e.get("last_name", ""), "position": e.get("position", "")})
-                    self.results["employees"].append({"name": f"{e.get('first_name', '')} {e.get('last_name', '')}".strip(), "email": e.get("value", ""), "position": e.get("position", "")})
-                console.print(f"  [green][+] Found {len(data.get('emails', []))} emails[/green]")
-        except Exception as e:
-            console.print(f"  [red][-] Hunter.io failed: {e}[/red]")
+     console.print("[yellow][*] Hunter.io email & domain search...[/yellow]")
+     api_key = self.config.get("HUNTER_API_KEY", "")
+     if not api_key:
+         console.print("  [red][-] Hunter.io API key not set.[/red]")
+         return
+     try:
+         console.print(f"  [cyan]DEBUG: domain='{domain}' key='{api_key[:40]}...'[/cyan]")
+         resp = requests.get(
+             f"https://api.hunter.io/v2/domain-search?domain={domain}&api_key={api_key}&limit=100",
+             timeout=15,
+         )
+
+         if resp.status_code == 401:
+             console.print("  [red][-] Hunter.io API key is invalid.[/red]")
+             return
+         if resp.status_code == 429:
+             console.print("  [red][-] Hunter.io rate limit reached.[/red]")
+             return
+         if resp.status_code != 200:
+             console.print(f"  [red][-] Hunter.io returned {resp.status_code}[/red]")
+             console.print(f"  [red][-] Response: {resp.text}[/red]")
+             return
+
+         data = resp.json().get("data", {})
+         self.results["email_format"] = data.get("pattern", "Unknown")
+
+         for e in data.get("emails", []):
+             # Save the email
+             self.results["email_addresses"].append({
+                 "email": e.get("value", ""),
+                 "type": e.get("type", ""),
+                 "confidence": e.get("confidence", 0),
+                 "first_name": e.get("first_name", ""),
+                 "last_name": e.get("last_name", ""),
+                 "position": e.get("position", ""),
+             })
+
+             # Save as employee
+             self.results["employees"].append({
+                 "name": f"{e.get('first_name', '')} {e.get('last_name', '')}".strip(),
+                 "email": e.get("value", ""),
+                 "position": e.get("position", ""),
+             })
+
+            # NEW: Extract subdomains from the sources where
+            # Hunter found this email (web pages, etc.)
+             for source in e.get("sources", []):
+                 src_domain = source.get("domain", "")
+                 if (
+                     src_domain
+                     and src_domain.endswith(f".{domain}")
+                     and src_domain != domain
+                     and src_domain not in self.results["subdomains"]
+                 ):
+                     self.results["subdomains"].append(src_domain)
+                     console.print(
+                         f"  [cyan][+] Subdomain from Hunter: {src_domain}[/cyan]"
+                     )
+
+        # NEW: Check for linked domains in the response
+         for linked in data.get("linked_domains", []):
+             ld = linked if isinstance(linked, str) else linked.get("domain", "")
+             if (
+                 ld
+                 and ld.endswith(f".{domain}")
+                 and ld != domain
+                 and ld not in self.results["subdomains"]
+             ):
+                 self.results["subdomains"].append(ld)
+                 console.print(f"  [cyan][+] Linked domain from Hunter: {ld}[/cyan]")
+
+         email_count = len(data.get("emails", []))
+         sub_count = len(self.results["subdomains"])
+         console.print(
+             f"  [green][+] Found {email_count} emails, {sub_count} subdomains[/green]"
+         )
+
+     except Exception as e:
+         console.print(f"  [red][-] Hunter.io failed: {e}[/red]")
 
     def _breaches(self, domain):
         console.print("[yellow][*] Checking breach exposure...[/yellow]")

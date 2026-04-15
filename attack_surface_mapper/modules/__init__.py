@@ -9,3 +9,8 @@ from .third_party_exposure import ThirdPartyExposureScanner
 from .physical_assets import PhysicalAssetScanner
 from .shadow_it_detection import ShadowITDetector
 from .report_generator import ReportGenerator
+from .secret_scanner import SecretScanner
+from .web_vuln_scanner import WebVulnScanner
+from .cf_scanner import CloudflareScanner
+
+from modules.google_dorking import GoogleDorker

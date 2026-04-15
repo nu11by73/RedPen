@@ -27,6 +27,7 @@ class ASNIPEnumerator:
         self._bgp_asn_lookup(target_domain, company_name)
         self._shodan_host_search(primary_ips)
         self._shodan_org_search(company_name)
+        self._verify_ports()
         self._reverse_dns_sweep(primary_ips)
         self._generate_next_steps()
         return self.results
@@ -194,6 +195,59 @@ class ASNIPEnumerator:
                         self.results["shadow_it_flags"].append({"type": "Unregistered IP in Org", "asset": ip, "reason": f"Found in Shodan under org but not in DNS. May be shadow IT."})
         except Exception as e:
             console.print(f"  [red][-] Shodan org search failed: {e}[/red]")
+
+    def _verify_ports(self):
+        """Verify Shodan-reported ports are actually open with a live socket check."""
+        console.print("[yellow][*] Verifying Shodan ports with live checks...[/yellow]")
+
+        self.results["verified_ports"] = {}
+        timeout = 3  # seconds per port check
+
+        for ip, data in self.results["open_ports"].items():
+            reported_ports = data.get("ports", [])
+            if not reported_ports:
+                continue
+
+            verified = []
+            closed = []
+
+            for port in reported_ports:
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(timeout)
+                    result = sock.connect_ex((ip, int(port)))
+                    sock.close()
+
+                    if result == 0:
+                        verified.append(port)
+                    else:
+                        closed.append(port)
+                except (socket.timeout, OSError):
+                    closed.append(port)
+                except Exception:
+                    closed.append(port)
+
+            self.results["verified_ports"][ip] = {
+                "open": verified,
+                "closed_or_filtered": closed,
+                "os": data.get("os", "Unknown"),
+                "hostnames": data.get("hostnames", []),
+                "vulns": data.get("vulns", []),
+                "services": [s for s in data.get("services", []) if s.get("port") in verified],
+            }
+
+            v_count = len(verified)
+            c_count = len(closed)
+            total = len(reported_ports)
+
+            if v_count == total:
+                console.print(f"  [green][+] {ip}: {v_count}/{total} ports confirmed open[/green]")
+            elif v_count > 0:
+                console.print(f"  [yellow][!] {ip}: {v_count}/{total} open, {c_count} closed/filtered[/yellow]")
+                console.print(f"      Open: {verified}")
+                console.print(f"      Closed/Filtered: {closed}")
+            else:
+                console.print(f"  [red][-] {ip}: 0/{total} ports verified (all closed/filtered)[/red]")
 
     def _reverse_dns_sweep(self, ips):
         console.print("[yellow][*] Reverse DNS lookups...[/yellow]")

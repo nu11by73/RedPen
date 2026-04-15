@@ -1,4 +1,4 @@
-﻿import requests
+import requests
 import dns.resolver
 import dns.zone
 import dns.query
@@ -6,6 +6,9 @@ import socket
 import time
 import re
 from rich.console import Console
+from modules.google_dorking import GoogleDorker
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 console = Console()
 

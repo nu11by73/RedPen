@@ -1,10 +1,12 @@
 ﻿import ssl
 import socket
 import requests
+import time
 from datetime import datetime
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from rich.console import Console
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 console = Console()
 
@@ -80,50 +82,113 @@ class SSLCertEnumerator:
             console.print(f"  [red][-] CertSpotter also failed: {e}[/red]")
 
     def _analyze_certs(self, targets):
-        console.print("[yellow][*] Analyzing SSL certificates...[/yellow]")
-        for hostname in targets[:30]:
+        console.print("[yellow][*] Analyzing SSL certificates (threaded)...[/yellow]")
+
+        def _analyze_one(hostname):
             try:
                 ctx = ssl.create_default_context()
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
-                with socket.create_connection((hostname, 443), timeout=10) as sock:
+                with socket.create_connection((hostname, 443), timeout=7) as sock:
                     with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
                         cert_der = ssock.getpeercert(binary_form=True)
-                        cert = x509.load_der_x509_certificate(cert_der, default_backend())
+                        cert = x509.load_der_x509_certificate(
+                            cert_der, default_backend()
+                        )
                         subject = cert.subject.rfc4514_string()
                         issuer = cert.issuer.rfc4514_string()
                         not_after = cert.not_valid_after_utc
                         key_size = cert.public_key().key_size
                         sans = []
                         try:
-                            san_ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+                            san_ext = cert.extensions.get_extension_for_class(
+                                x509.SubjectAlternativeName
+                            )
                             sans = san_ext.value.get_values_for_type(x509.DNSName)
                         except Exception:
                             pass
-                        info = {"hostname": hostname, "subject": subject, "issuer": issuer, "not_after": str(not_after), "key_size": key_size, "sans": sans, "self_signed": subject == issuer}
-                        self.results["certificates"].append(info)
-                        console.print(f"  [green][+] {hostname}: Valid until {not_after}, Key: {key_size}bit, SANs: {len(sans)}[/green]")
-                        now = datetime.utcnow()
-                        na = not_after.replace(tzinfo=None) if not_after.tzinfo else not_after
-                        if na < now:
-                            self.results["expired_certs"].append(info)
-                            console.print(f"      [bold red][!] EXPIRED![/bold red]")
-                        if key_size < 2048:
-                            self.results["weak_certs"].append(info)
-                            console.print(f"      [bold red][!] WEAK KEY: {key_size}[/bold red]")
-                        if info["self_signed"]:
-                            console.print(f"      [bold yellow][!] SELF-SIGNED[/bold yellow]")
-                            self.results["shadow_it_flags"].append({"type": "Self-Signed Certificate", "asset": hostname, "reason": "Not enrolled in org PKI/certificate management."})
-                        for san in sans:
-                            san = san.lower().strip()
-                            if "*" not in san:
-                                existing = [s["subdomain"] for s in self.results["cert_subdomains"]]
-                                if san not in existing:
-                                    self.results["cert_subdomains"].append({"subdomain": san, "source": f"SAN from {hostname}"})
-            except (ssl.SSLError, socket.timeout, socket.gaierror, ConnectionRefusedError, OSError):
-                pass
+                        return {
+                            "hostname": hostname,
+                            "subject": subject,
+                            "issuer": issuer,
+                            "not_after": str(not_after),
+                            "not_after_dt": not_after,
+                            "key_size": key_size,
+                            "sans": sans,
+                            "self_signed": subject == issuer,
+                        }
+            except (ssl.SSLError, socket.timeout, socket.gaierror,
+                    ConnectionRefusedError, OSError):
+                return None
             except Exception as e:
-                console.print(f"  [red][-] Cert analysis failed for {hostname}: {e}[/red]")
+                console.print(
+                    f"  [red][-] Cert analysis failed for {hostname}: {e}[/red]"
+                )
+                return None
+
+        with ThreadPoolExecutor(max_workers=15) as executor:
+            futures = {
+                executor.submit(_analyze_one, h): h
+                for h in targets[:30]
+            }
+            for future in as_completed(futures):
+                info = future.result()
+                if info is None:
+                    continue
+
+                hostname = info["hostname"]
+                not_after_dt = info.pop("not_after_dt")
+
+                self.results["certificates"].append(info)
+                console.print(
+                    f"  [green][+] {hostname}: Valid until"
+                    f" {info['not_after']}, Key: {info['key_size']}bit,"
+                    f" SANs: {len(info['sans'])}[/green]"
+                )
+
+                now = datetime.utcnow()
+                na = (
+                    not_after_dt.replace(tzinfo=None)
+                    if not_after_dt.tzinfo else not_after_dt
+                )
+                if na < now:
+                    self.results["expired_certs"].append(info)
+                    console.print(
+                        f"      [bold red][!] EXPIRED![/bold red]"
+                    )
+
+                if info["key_size"] < 2048:
+                    self.results["weak_certs"].append(info)
+                    console.print(
+                        f"      [bold red][!] WEAK KEY:"
+                        f" {info['key_size']}[/bold red]"
+                    )
+
+                if info["self_signed"]:
+                    console.print(
+                        f"      [bold yellow][!] SELF-SIGNED[/bold yellow]"
+                    )
+                    self.results["shadow_it_flags"].append({
+                        "type": "Self-Signed Certificate",
+                        "asset": hostname,
+                        "reason": (
+                            "Not enrolled in org PKI/"
+                            "certificate management."
+                        ),
+                    })
+
+                for san in info["sans"]:
+                    san = san.lower().strip()
+                    if "*" not in san:
+                        existing = [
+                            s["subdomain"]
+                            for s in self.results["cert_subdomains"]
+                        ]
+                        if san not in existing:
+                            self.results["cert_subdomains"].append({
+                                "subdomain": san,
+                                "source": f"SAN from {hostname}",
+                            })
 
     def _next_steps(self):
         steps = []

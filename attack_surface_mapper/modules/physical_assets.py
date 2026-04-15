@@ -1,6 +1,7 @@
 ﻿import requests
 import socket
 from rich.console import Console
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 console = Console()
 
@@ -21,45 +22,130 @@ class PhysicalAssetScanner:
         return self.results
 
     def _mobile_apps(self, company):
-        console.print("[yellow][*] Checking mobile apps...[/yellow]")
-        try:
-            resp = requests.get(f"https://itunes.apple.com/search?term={requests.utils.quote(company)}&entity=software&limit=10", timeout=10)
-            if resp.status_code == 200:
-                for app in resp.json().get("results", []):
-                    self.results["mobile_apps"].append({"platform": "iOS", "name": app.get("trackName"), "developer": app.get("sellerName"), "bundle_id": app.get("bundleId")})
-                    console.print(f"  [green][+] iOS: {app.get('trackName')}[/green]")
-        except Exception:
-            pass
+     console.print("[yellow][*] Checking mobile apps...[/yellow]")
+     try:
+         resp = requests.get(
+             f"https://itunes.apple.com/search?term={requests.utils.quote(company)}&entity=software&limit=25",
+             timeout=10,
+         )
+         if resp.status_code != 200:
+             return
+
+        # Build match terms from company name
+        # e.g. "LPL Financial" -> ["lpl financial", "lpl", "financial"]
+         company_lower = company.lower().strip()
+         company_tokens = [t for t in company_lower.split() if len(t) > 2]
+        # Primary match: full company name or first significant token
+         primary_token = company_tokens[0] if company_tokens else company_lower
+
+         for app in resp.json().get("results", []):
+             seller = (app.get("sellerName") or "").lower()
+             artist = (app.get("artistName") or "").lower()
+             bundle = (app.get("bundleId") or "").lower()
+
+            # Check if the app actually belongs to this company
+             is_match = False
+
+            # 1. Full company name in seller or artist
+             if company_lower in seller or company_lower in artist:
+                is_match = True
+
+            # 2. Primary token matches at word boundary in seller/artist
+             elif primary_token in seller.split() or primary_token in artist.split():
+                 is_match = True
+
+            # 3. Company name or domain appears in bundle ID
+            #    e.g. "com.lpl.clientworks" matches "lpl"
+             elif primary_token in bundle.split('.'):
+                 is_match = True
+
+             if not is_match:
+                 continue
+
+             self.results["mobile_apps"].append({
+                 "platform": "iOS",
+                 "name": app.get("trackName"),
+                 "developer": app.get("sellerName"),
+                 "bundle_id": app.get("bundleId"),
+             })
+             console.print(f"  [green][+] iOS: {app.get('trackName')} ({app.get('sellerName')})[/green]")
+
+     except Exception as e:
+         console.print(f"  [red][-] App store search failed: {e}[/red]")
 
     def _exposed_devices(self, domain, shodan_data=None):
-        console.print("[yellow][*] Checking exposed devices...[/yellow]")
-        device_types = {"printer": "Printer", "camera": "Camera", "voip": "Phone", "nas": "NAS", "ups": "UPS"}
+        console.print("[yellow][*] Checking exposed devices (threaded)...[/yellow]")
+        device_types = {
+            "printer": "Printer", "camera": "Camera",
+            "voip": "Phone", "nas": "NAS", "ups": "UPS",
+        }
         if shodan_data:
             for ip, data in shodan_data.items():
                 for svc in data.get("services", []):
-                    banner = (svc.get("banner", "") + svc.get("product", "")).lower()
+                    banner = (
+                        svc.get("banner", "") + svc.get("product", "")
+                    ).lower()
                     for kw, dtype in device_types.items():
                         if kw in banner:
-                            self.results["exposed_devices"].append({"type": dtype, "ip": ip, "port": svc.get("port")})
-                            console.print(f"  [red][!] Exposed {dtype}: {ip}:{svc.get('port')}[/red]")
-                            self.results["shadow_it_flags"].append({"type": f"Exposed {dtype}", "asset": f"{ip}:{svc.get('port')}", "reason": "Physical device on internet."})
-        for prefix in ["printer", "camera", "nas", "voip"]:
+                            self.results["exposed_devices"].append({
+                                "type": dtype, "ip": ip,
+                                "port": svc.get("port"),
+                            })
+                            console.print(
+                                f"  [red][!] Exposed {dtype}:"
+                                f" {ip}:{svc.get('port')}[/red]"
+                            )
+                            self.results["shadow_it_flags"].append({
+                                "type": f"Exposed {dtype}",
+                                "asset": f"{ip}:{svc.get('port')}",
+                                "reason": "Physical device on internet.",
+                            })
+
+        prefixes = ["printer", "camera", "nas", "voip"]
+
+        def _check(prefix):
+            target = f"{prefix}.{domain}"
             try:
-                ip = socket.gethostbyname(f"{prefix}.{domain}")
-                self.results["exposed_devices"].append({"type": prefix, "hostname": f"{prefix}.{domain}", "ip": ip})
-                console.print(f"  [yellow][!] {prefix}.{domain} -> {ip}[/yellow]")
+                ip = socket.gethostbyname(target)
+                return (prefix, target, ip)
             except Exception:
-                pass
+                return None
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            for result in executor.map(_check, prefixes):
+                if result:
+                    prefix, hostname, ip = result
+                    self.results["exposed_devices"].append({
+                        "type": prefix, "hostname": hostname, "ip": ip,
+                    })
+                    console.print(
+                        f"  [yellow][!] {hostname} -> {ip}[/yellow]"
+                    )
 
     def _byod(self, domain):
-        console.print("[yellow][*] Checking MDM/BYOD...[/yellow]")
-        for prefix in ["mdm", "intune", "jamf", "airwatch", "workspace"]:
+        console.print("[yellow][*] Checking MDM/BYOD (threaded)...[/yellow]")
+        prefixes = ["mdm", "intune", "jamf", "airwatch", "workspace"]
+
+        def _check(prefix):
+            target = f"{prefix}.{domain}"
             try:
-                ip = socket.gethostbyname(f"{prefix}.{domain}")
-                self.results["byod_indicators"].append({"type": "MDM", "hostname": f"{prefix}.{domain}", "ip": ip})
-                console.print(f"  [green][+] MDM: {prefix}.{domain}[/green]")
+                ip = socket.gethostbyname(target)
+                return (prefix, target, ip)
             except Exception:
-                pass
+                return None
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            for result in executor.map(_check, prefixes):
+                if result:
+                    prefix, hostname, ip = result
+                    self.results["byod_indicators"].append({
+                        "type": "MDM",
+                        "hostname": hostname,
+                        "ip": ip,
+                    })
+                    console.print(
+                        f"  [green][+] MDM: {hostname}[/green]"
+                    )
 
     def _next_steps(self):
         steps = []

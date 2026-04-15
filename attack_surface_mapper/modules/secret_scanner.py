@@ -1,804 +1,738 @@
-import requests
+"""
+Secret Scanner Module v2.1 - Fixed
+Fixes: deduplication, false positives, severity classification, HTTP fallback, detailed reporting
+"""
+
 import re
+import requests
+import logging
 import time
-import json
-import signal
 from urllib.parse import urljoin, urlparse
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich.console import Console
-from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+from rich.panel import Panel
+
+try:
+    from bs4 import BeautifulSoup
+    HAS_BS4 = True
+except ImportError:
+    HAS_BS4 = False
+
+logger = logging.getLogger(__name__)
 
 console = Console()
-
-
-class TimeoutException(Exception):
-    pass
-
-
 class SecretScanner:
     def __init__(self, config):
         self.config = config
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": config["USER_AGENT"]})
+        ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        if isinstance(config, dict):
+            ua = config.get('USER_AGENT', ua)
+            self.timeout = config.get('REQUEST_TIMEOUT', 10)
+            self.max_crawl = config.get('MAX_CRAWL_PAGES', 15)
+        else:
+            ua = getattr(config, 'USER_AGENT', ua)
+            self.timeout = getattr(config, 'REQUEST_TIMEOUT', 10)
+            self.max_crawl = getattr(config, 'MAX_CRAWL_PAGES', 15)
+        self.session.headers.update({'User-Agent': ua})
         self.session.verify = False
-        self.results = {
-            "secrets_found": [],
-            "api_keys_found": [],
-            "hardcoded_passwords": [],
-            "exposed_tokens": [],
-            "js_files_scanned": [],
-            "api_endpoints_found": [],
-            "env_files": [],
-            "config_leaks": [],
-            "next_steps": [],
-            "shadow_it_flags": [],
-        }
-        self.scanned_urls = set()
-        self.js_urls = set()
-        self.dead_hosts = set()
-        self.slow_hosts = set()
+        self.visited = set()
+        self.seen_secrets = OrderedDict()
+        self.patterns = self._build_patterns()
 
-        # Tunable limits
-        self.MAX_SUBDOMAINS = 25
-        self.MAX_API_PATHS_PER_HOST = 40
-        self.MAX_JS_FILES = 50
-        self.MAX_SENSITIVE_PATHS_PER_HOST = 20
-        self.HOST_TIMEOUT = 5
-        self.HOST_FAIL_THRESHOLD = 3
-        self.MODULE_TIMEOUT = 300  # 5 minute max for entire module
+    # ──────────────────────────────────────────────
+    #  PATTERN DEFINITIONS
+    # ──────────────────────────────────────────────
 
-        self.host_fail_count = {}
-        self.module_start = None
-
-        self.secret_patterns = {
-            "AWS Access Key": r'AKIA[0-9A-Z]{16}',
-            "AWS Secret Key": r'(?i)aws[_\-]?secret[_\-]?access[_\-]?key[\s]*[=:]\s*["\']?([A-Za-z0-9/+=]{40})["\']?',
-            "AWS MWS Key": r'amzn\.mws\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
-            "Azure Storage Key": r'(?i)(?:DefaultEndpointsProtocol|AccountKey)\s*=\s*[^\s;]{20,}',
-            "Azure Client Secret": r'(?i)azure[_\-]?(?:client[_\-]?secret|tenant)[_\-]?(?:id|key)?\s*[=:]\s*["\']?([a-zA-Z0-9\-_.~]{20,})["\']?',
-            "GCP API Key": r'AIza[0-9A-Za-z\-_]{35}',
-            "GCP Service Account": r'"type"\s*:\s*"service_account"',
-            "GCP OAuth": r'[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com',
-            "Google OAuth Token": r'ya29\.[0-9A-Za-z\-_]+',
-            "Firebase URL": r'https://[a-z0-9\-]+\.firebaseio\.com',
-            "Slack Token": r'xox[bpors]-[0-9]{10,13}-[0-9]{10,13}[a-zA-Z0-9-]*',
-            "Slack Webhook": r'https://hooks\.slack\.com/services/T[a-zA-Z0-9_]+/B[a-zA-Z0-9_]+/[a-zA-Z0-9_]+',
-            "GitHub Token": r'gh[pousr]_[A-Za-z0-9_]{36,255}',
-            "GitLab Token": r'glpat-[A-Za-z0-9\-]{20,}',
-            "Stripe Secret Key": r'sk_live_[0-9a-zA-Z]{24,}',
-            "Stripe Publishable Key": r'pk_live_[0-9a-zA-Z]{24,}',
-            "Square Access Token": r'sq0atp-[0-9A-Za-z\-_]{22}',
-            "PayPal Braintree Token": r'access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}',
-            "Twilio API Key": r'SK[0-9a-fA-F]{32}',
-            "Twilio Account SID": r'AC[a-zA-Z0-9_\-]{32}',
-            "SendGrid API Key": r'SG\.[a-zA-Z0-9\-_]{22}\.[a-zA-Z0-9\-_]{43}',
-            "Mailgun API Key": r'key-[0-9a-zA-Z]{32}',
-            "Mailchimp API Key": r'[0-9a-f]{32}-us[0-9]{1,2}',
-            "Shopify Token": r'shpat_[a-fA-F0-9]{32}',
-            "Dropbox Token": r'(?:sl\.[A-Za-z0-9\-_]{100,})',
-            "Discord Bot Token": r'[MN][A-Za-z\d]{23,}\.[\w-]{6}\.[\w-]{27}',
-            "Discord Webhook": r'https://discord(?:app)?\.com/api/webhooks/\d+/[\w\-]+',
-            "Telegram Bot Token": r'[0-9]+:AA[0-9A-Za-z\-_]{33}',
-            "Twitter Bearer Token": r'AAAAAAAAAAAAAAAAAAAAA[a-zA-Z0-9%]+',
-            "Facebook Access Token": r'EAACEdEose0cBA[0-9A-Za-z]+',
-            "New Relic Key": r'NRAK-[A-Z0-9]{27}',
-            "Sentry DSN": r'https://[a-f0-9]{32}@[a-z0-9\-\.]+\.ingest\.sentry\.io/[0-9]+',
-            "Mapbox Token": r'pk\.eyJ1[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+',
-            "Basic Auth Header": r'(?i)authorization:\s*basic\s+[A-Za-z0-9+/=]{10,}',
-            "Bearer Token": r'(?i)(?:authorization:\s*bearer|bearer[_\-]?token)\s*[=:]\s*["\']?([A-Za-z0-9\-_\.]{20,})["\']?',
-            "JWT Token": r'eyJ[A-Za-z0-9\-_]+\.eyJ[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+',
-            "Generic API Key": r'(?i)(?:api[_\-]?key|apikey|api[_\-]?secret)\s*[=:]\s*["\']?([a-zA-Z0-9\-_]{16,64})["\']?',
-            "Generic Secret": r'(?i)(?:secret[_\-]?key|client[_\-]?secret|app[_\-]?secret)\s*[=:]\s*["\']?([a-zA-Z0-9\-_]{16,64})["\']?',
-            "Generic Token": r'(?i)(?:access[_\-]?token|auth[_\-]?token|session[_\-]?token)\s*[=:]\s*["\']?([a-zA-Z0-9\-_\.]{20,})["\']?',
-            "Private Key": r'-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----',
-            "PGP Private Key": r'-----BEGIN PGP PRIVATE KEY BLOCK-----',
-            "MySQL Connection": r'(?i)mysql://[^\s<>"\']+',
-            "PostgreSQL Connection": r'(?i)postgres(?:ql)?://[^\s<>"\']+',
-            "MongoDB Connection": r'mongodb(?:\+srv)?://[^\s<>"\']+',
-            "Redis Connection": r'redis://[^\s<>"\']+',
-            "JDBC Connection": r'jdbc:[a-z]+://[^\s<>"\']+',
-            "FTP Credentials": r'ftp://[^\s@]+:[^\s@]+@[^\s<>"\']+',
-            "SMTP Credentials": r'(?i)smtp://[^\s@]+:[^\s@]+@[^\s<>"\']+',
-            "Hardcoded Password": r'(?i)(?:password|passwd|pwd|pass)\s*[=:]\s*["\']([^"\']{6,64})["\']',
-            "Database Password": r'(?i)(?:db[_\-]?password|database[_\-]?password|db[_\-]?pass)\s*[=:]\s*["\']?([^\s"\']{4,})["\']?',
-            "Admin Password": r'(?i)(?:admin[_\-]?password|admin[_\-]?pass|root[_\-]?password)\s*[=:]\s*["\']?([^\s"\']{4,})["\']?',
-            "Default Credentials": r'(?i)(?:admin|root|test|guest|demo)[\s]*[:/][\s]*(?:admin|root|password|test|guest|demo|12345|changeme)',
-            "Internal URL": r'https?://(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|localhost)[:/][\w\-/.?=&]*',
-        }
-
-        self.api_paths = [
-            "/api", "/api/v1", "/api/v2", "/api/v3",
-            "/rest", "/rest/v1", "/rest/v2",
-            "/graphql", "/graphiql", "/playground",
-            "/swagger.json", "/swagger.yaml", "/swagger-ui.html",
-            "/openapi.json", "/openapi.yaml",
-            "/api-docs", "/api-docs.json",
-            "/docs", "/redoc",
-            "/health", "/healthz", "/healthcheck",
-            "/status", "/status.json", "/server-status", "/server-info",
-            "/metrics", "/prometheus/metrics",
-            "/info", "/version",
-            "/auth", "/auth/login", "/auth/token",
-            "/oauth/token", "/oauth/authorize",
-            "/login", "/token",
-            "/.well-known/openid-configuration",
-            "/.well-known/jwks.json",
-            "/api/users", "/api/v1/users", "/api/me",
-            "/admin", "/admin/api", "/console", "/dashboard",
-            "/internal", "/internal/api",
-            "/debug", "/debug/vars",
-            "/actuator", "/actuator/env", "/actuator/health",
-            "/actuator/info", "/actuator/configprops",
-            "/actuator/mappings", "/actuator/heapdump",
-            "/env", "/beans", "/configprops", "/mappings",
-            "/telescope", "/horizon",
-            "/.env", "/.env.local", "/.env.production",
-            "/.env.staging", "/.env.backup",
-            "/config.json", "/config.yaml",
-            "/settings.json",
-            "/.git/HEAD", "/.git/config",
-            "/.gitignore",
-            "/.svn/entries",
-            "/docker-compose.yml",
-            "/wp-config.php.bak", "/wp-config.php.old",
-            "/application.properties", "/application.yml",
-            "/appsettings.json",
-            "/phpinfo.php", "/info.php",
-            "/backup.sql", "/dump.sql",
-            "/backup.zip", "/site.zip",
-            "/robots.txt", "/sitemap.xml",
-            "/.well-known/security.txt",
-            "/elasticsearch/", "/_search", "/_cat/indices",
-            "/solr/admin/",
-            "/_all_dbs", "/_utils",
-            "/phpmyadmin/", "/adminer.php",
-            "/webhook", "/webhooks",
-            "/graphql?query={__schema{types{name}}}",
+    def _build_patterns(self):
+        patterns = [
+            {
+                'name': 'AWS Access Key ID',
+                'regex': r'(?<![A-Z0-9])AKIA[0-9A-Z]{16}(?![A-Z0-9])',
+                'category': 'api_keys_found',
+                'severity': 'CRITICAL',
+                'validate': None,
+            },
+            {
+             'name': 'AWS Secret Access Key',
+             'regex': r'(?:aws_secret_access_key|AWS_SECRET_ACCESS_KEY|SecretAccessKey|aws_secret|AWSSecretKey|secret_access_key|SECRET_KEY)\s*[:=]\s*["\']?([A-Za-z0-9/+=]{40})["\']?',
+             'category': 'api_keys_found',
+             'severity': 'CRITICAL',
+             'validate': None,
+            },
+            {
+                'name': 'GCP API Key',
+                'regex': r'AIza[0-9A-Za-z\-_]{35}',
+                'category': 'api_keys_found',
+                'severity': 'MEDIUM',
+                'validate': None,
+            },
+            {
+                'name': 'Stripe Secret Key',
+                'regex': r'sk_live_[0-9a-zA-Z]{24,}',
+                'category': 'api_keys_found',
+                'severity': 'CRITICAL',
+                'validate': None,
+            },
+            {
+                'name': 'Stripe Publishable Key',
+                'regex': r'pk_live_[0-9a-zA-Z]{24,}',
+                'category': 'api_keys_found',
+                'severity': 'INFO',
+                'validate': None,
+            },
+            {
+                'name': 'Slack Token',
+                'regex': r'xox[baprs]-[0-9]{10,13}-[0-9]{10,13}[a-zA-Z0-9\-]*',
+                'category': 'api_keys_found',
+                'severity': 'CRITICAL',
+                'validate': None,
+            },
+            {
+                'name': 'GitHub Token',
+                'regex': r'gh[pousr]_[A-Za-z0-9_]{36,}',
+                'category': 'api_keys_found',
+                'severity': 'CRITICAL',
+                'validate': None,
+            },
+            {
+                'name': 'SendGrid API Key',
+                'regex': r'SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}',
+                'category': 'api_keys_found',
+                'severity': 'CRITICAL',
+                'validate': None,
+            },
+            {
+                'name': 'Mailgun API Key',
+                'regex': r'key-[0-9a-zA-Z]{32}',
+                'category': 'api_keys_found',
+                'severity': 'CRITICAL',
+                'validate': None,
+            },
+            {
+                'name': 'Firebase API Key',
+                'regex': r'AAAA[A-Za-z0-9_-]{7}:[A-Za-z0-9_-]{140}',
+                'category': 'api_keys_found',
+                'severity': 'HIGH',
+                'validate': None,
+            },
+            {
+                'name': 'GCP OAuth Client ID',
+                'regex': r'[0-9]{6,}-[a-z0-9]{32}\.apps\.googleusercontent\.com',
+                'category': 'credentials_found',
+                'severity': 'INFO',
+                'validate': None,
+            },
+            {
+                'name': 'Basic Auth in URL',
+                'regex': r'https?://[^\s"\'<>{}]+:[^\s"\'<>{}]+@[a-zA-Z0-9][-a-zA-Z0-9.]+\.[a-zA-Z]{2,}',
+                'category': 'credentials_found',
+                'severity': 'CRITICAL',
+                'validate': self._validate_basic_auth,
+            },
+            {
+                'name': 'Private Key',
+                'regex': r'-----BEGIN\s+(?:RSA\s+|EC\s+|DSA\s+|OPENSSH\s+)?PRIVATE\s+KEY-----',
+                'category': 'credentials_found',
+                'severity': 'CRITICAL',
+                'validate': None,
+            },
+            {
+                'name': 'Database Connection String',
+                'regex': r'(?:mongodb|postgres|mysql|mssql|redis)://[^\s"\'<>]+:[^\s"\'<>]+@[^\s"\'<>]+',
+                'category': 'credentials_found',
+                'severity': 'CRITICAL',
+                'validate': None,
+            },
+            {
+                'name': 'Mapbox Public Token',
+                'regex': r'pk\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+',
+                'category': 'exposed_tokens',
+                'severity': 'INFO',
+                'validate': None,
+            },
+            {
+                'name': 'Mapbox Secret Token',
+                'regex': r'sk\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+',
+                'category': 'exposed_tokens',
+                'severity': 'CRITICAL',
+                'validate': None,
+            },
+            {
+                'name': 'Twilio Account SID',
+                'regex': r'\bAC[0-9a-f]{32}\b',
+                'category': 'exposed_tokens',
+                'severity': 'HIGH',
+                'validate': self._validate_twilio_sid,
+            },
+            {
+                'name': 'Twilio Auth Token',
+                'regex': r'(?:twilio|TWILIO)[^\n]{0,30}[0-9a-f]{32}',
+                'category': 'exposed_tokens',
+                'severity': 'CRITICAL',
+                'validate': None,
+            },
+            {
+                'name': 'Square Access Token',
+                'regex': r'sq0atp-[0-9A-Za-z\-_]{22}',
+                'category': 'exposed_tokens',
+                'severity': 'CRITICAL',
+                'validate': None,
+            },
+            {
+                'name': 'Square OAuth Secret',
+                'regex': r'sq0csp-[0-9A-Za-z\-_]{43}',
+                'category': 'exposed_tokens',
+                'severity': 'CRITICAL',
+                'validate': None,
+            },
+            {
+                'name': 'Hardcoded Password',
+                'regex': r'(?:password|passwd|pwd|secret|api_key|apikey|api-key|access_token|auth_token)\s*[:=]\s*["\']([^"\']{8,64})["\']',
+                'category': 'hardcoded_passwords',
+                'severity': 'CRITICAL',
+                'validate': self._validate_password,
+                'flags': re.IGNORECASE,
+            },
         ]
+        # Pre-compile all regex patterns for performance
+        for p in patterns:
+            p['compiled'] = re.compile(p['regex'], p.get('flags', 0))
+        return patterns
 
-    def _is_timed_out(self):
-        """Check if module has exceeded total timeout"""
-        if self.module_start and (time.time() - self.module_start) > self.MODULE_TIMEOUT:
+    # ──────────────────────────────────────────────
+    #  VALIDATORS
+    # ──────────────────────────────────────────────
+
+    def _validate_basic_auth(self, match, context, url):
+        matched = match.group(0)
+        safe_domains = ['schema.org', 'w3.org', 'xmlns.com', 'purl.org',
+                        'ogp.me', 'microformats.org', 'json-ld.org']
+        for d in safe_domains:
+            if d in matched:
+                return False
+        auth_m = re.search(r'://([^:]+):([^@]+)@', matched)
+        if not auth_m:
+            return False
+        user, passwd = auth_m.group(1), auth_m.group(2)
+        if passwd.isdigit() or len(passwd) < 4 or len(user) < 2:
+            return False
+        if re.search(r'content\s*=\s*["\']@', context):
+            return False
+        if re.search(r'twitter:|og:|meta\s+', context, re.IGNORECASE):
+            if '@' in matched:
+                return False
+        return True
+
+    def _validate_twilio_sid(self, match, context, url):
+        matched = match.group(0)
+        ctx_lower = context.lower()
+        twilio_indicators = ['twilio', 'sms', 'voice', 'messaging', 'accountsid',
+                             'account_sid', 'ACCOUNT_SID', 'twlo']
+        if any(ind in ctx_lower for ind in twilio_indicators):
             return True
+        if re.search(r'(?:class|id|style|data-[a-z]+|href|src)\s*=\s*["\'][^"\']*'
+                     + re.escape(matched), context, re.IGNORECASE):
+            return False
+        if re.search(r'(?:color|background|border|#)[^;]*' + re.escape(matched[:8]), ctx_lower):
+            return False
         return False
 
-    def _is_host_dead(self, host):
-        """Check if host should be skipped"""
-        base = host.split(":")[0]
-        if base in self.dead_hosts or base in self.slow_hosts:
-            return True
-        return False
+    def _validate_aws_secret(self, match, context, url):
+        ctx = context.lower()
+        indicators = ['aws', 'secret', 'access', 'key', 's3', 'iam', 'lambda',
+                      'dynamodb', 'ec2', 'credential']
+        return any(ind in ctx for ind in indicators)
 
-    def _record_host_fail(self, host):
-        """Track failures per host, mark dead after threshold"""
-        base = host.split(":")[0]
-        self.host_fail_count[base] = self.host_fail_count.get(base, 0) + 1
-        if self.host_fail_count[base] >= self.HOST_FAIL_THRESHOLD:
-            self.dead_hosts.add(base)
-            console.print(f"    [dim]Skipping {base} (too many failures)[/dim]")
+    def _validate_password(self, match, context, url):
+        if match.lastindex and match.group(1):
+            val = match.group(1)
+            placeholders = ['password', 'changeme', 'example', 'placeholder', 'xxx',
+                            'your_', 'insert_', 'todo', 'fixme', 'none', 'null',
+                            'undefined', '********', '${', '{{', 'process.env',
+                            'os.environ', 'config.', 'settings.']
+            if any(p in val.lower() for p in placeholders):
+                return False
+            if re.match(r'^[#.][a-zA-Z]', val):
+                return False
+            if re.match(r'^[a-zA-Z_]+$', val):
+                return False
+        return True
 
-    def _safe_request(self, url, method="get", timeout=None):
-        """Make a request with timeout and host tracking"""
-        if timeout is None:
-            timeout = self.HOST_TIMEOUT
+    # ──────────────────────────────────────────────
+    #  UTILITIES
+    # ──────────────────────────────────────────────
 
-        parsed = urlparse(url)
-        host = parsed.hostname or ""
+    def _mask_value(self, value):
+        if len(value) <= 8:
+            return value[:2] + '****'
+        return value[:4] + '****' + value[-4:]
 
-        if self._is_host_dead(host):
-            return None
-        if self._is_timed_out():
-            return None
+    def _get_context(self, text, match, radius=120):
+        start = max(0, match.start() - radius)
+        end = min(len(text), match.end() + radius)
+        ctx = text[start:end].replace('\n', ' ').replace('\r', '').strip()
+        prefix = '...' if start > 0 else ''
+        suffix = '...' if end < len(text) else ''
+        return f"{prefix}{ctx}{suffix}"
 
+    def _resolve_url(self, host):
+        """Find working URL for a hostname. Tries HTTPS first, falls back to HTTP."""
+        for scheme in ['https', 'http']:
+            url = f"{scheme}://{host}"
+            try:
+                resp = self.session.get(url, timeout=min(self.timeout, 5),
+                                        allow_redirects=True, stream=True)
+                resp.close()
+                if resp.status_code < 500:
+                    return url
+            except requests.exceptions.SSLError:
+                continue
+            except requests.exceptions.ConnectionError:
+                continue
+            except Exception:
+                continue
+        return None
+
+    def _fetch_page(self, url, _fallback=True):
         try:
-            if method == "head":
-                resp = self.session.head(url, timeout=timeout, allow_redirects=False)
-            else:
-                resp = self.session.get(url, timeout=timeout, allow_redirects=True)
-            return resp
-        except requests.exceptions.ConnectTimeout:
-            self.slow_hosts.add(host)
-            return None
-        except requests.exceptions.ReadTimeout:
-            self._record_host_fail(host)
-            return None
+            resp = self.session.get(url, timeout=self.timeout, allow_redirects=True)
+            if resp.status_code == 200:
+                return resp.text
+        except requests.exceptions.SSLError:
+            if _fallback and url.startswith('https://'):
+                alt = 'http://' + url[8:]
+                logger.debug(f"SSL failed for {url}, trying {alt}")
+                return self._fetch_page(alt, _fallback=False)
         except requests.exceptions.ConnectionError:
-            self._record_host_fail(host)
-            return None
-        except Exception:
-            self._record_host_fail(host)
-            return None
+            if _fallback and url.startswith('https://'):
+                alt = 'http://' + url[8:]
+                return self._fetch_page(alt, _fallback=False)
+        except Exception as e:
+            logger.debug(f"Fetch error {url}: {e}")
+        return None
 
-    def run(self, target_domain, subdomains=None, web_app_data=None):
-        console.print(f"\n[bold cyan]{'='*60}[/bold cyan]")
-        console.print(f"[bold cyan]  Module 10: Secret & API Key Scanner - {target_domain}[/bold cyan]")
-        console.print(f"[bold cyan]{'='*60}[/bold cyan]\n")
+    def _extract_links(self, html, base_url):
+        links = set()
+        if HAS_BS4:
+            try:
+                soup = BeautifulSoup(html, 'html.parser')
+                base_netloc = urlparse(base_url).netloc
+                for a in soup.find_all('a', href=True):
+                    full = urljoin(base_url, a['href'])
+                    p = urlparse(full)
+                    if p.netloc == base_netloc and p.scheme in ('http', 'https'):
+                        clean = f"{p.scheme}://{p.netloc}{p.path}"
+                        if p.query:
+                            clean += f"?{p.query}"
+                        links.add(clean)
+            except Exception:
+                pass
+        else:
+            for m in re.finditer(r'href=["\']([^"\']+)["\']', html):
+                full = urljoin(base_url, m.group(1))
+                p = urlparse(full)
+                base_netloc = urlparse(base_url).netloc
+                if p.netloc == base_netloc and p.scheme in ('http', 'https'):
+                    links.add(f"{p.scheme}://{p.netloc}{p.path}")
+        return links
 
-        self.module_start = time.time()
+    def _extract_js_files(self, html, base_url):
+        js = set()
+        for m in re.finditer(r'<script[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE):
+            js.add(urljoin(base_url, m.group(1)))
+        return js
 
-        # Build target list
-        targets = [target_domain]
-        if subdomains:
-            for sub in subdomains:
-                s = sub.get("subdomain", "") if isinstance(sub, dict) else sub
-                if s and s not in targets:
-                    targets.append(s)
+    # ──────────────────────────────────────────────
+    #  SCANNING
+    # ──────────────────────────────────────────────
 
-        # Limit targets
-        if len(targets) > self.MAX_SUBDOMAINS:
-            console.print(f"[yellow][!] Limiting to {self.MAX_SUBDOMAINS} of {len(targets)} subdomains[/yellow]")
-            targets = targets[:self.MAX_SUBDOMAINS]
+    def _scan_text(self, text, source_url, source_type):
+        findings = []
+        for pattern in self.patterns:
+            for match in pattern['compiled'].finditer(text):
+                matched_value = match.group(0)
+                context = self._get_context(text, match)
 
-        console.print(f"[yellow][*] Scanning {len(targets)} targets (timeout: {self.MODULE_TIMEOUT}s)[/yellow]\n")
-
-        # Phase 1: Probe which hosts are alive first
-        live_targets = self._probe_hosts(targets)
-
-        if not live_targets:
-            console.print("[red][-] No live hosts found. Skipping secret scan.[/red]")
-            self._generate_summary()
-            return self.results
-
-        # Phase 2: Scan pages for secrets
-        if not self._is_timed_out():
-            self._scan_pages(live_targets)
-
-        # Phase 3: Find and scan JS files
-        if not self._is_timed_out():
-            self._find_js_files(live_targets)
-            self._scan_js_files()
-
-        # Phase 4: Check sensitive file paths
-        if not self._is_timed_out():
-            self._check_sensitive_paths(live_targets)
-
-        # Phase 5: Discover API endpoints
-        if not self._is_timed_out():
-            self._discover_apis(live_targets)
-
-        # Phase 6: Check env files
-        if not self._is_timed_out():
-            self._check_env_files(live_targets)
-
-        if self._is_timed_out():
-            elapsed = int(time.time() - self.module_start)
-            console.print(f"\n[yellow][!] Module timeout reached ({elapsed}s). Partial results below.[/yellow]")
-
-        self._generate_summary()
-        self._next_steps()
-
-        elapsed = int(time.time() - self.module_start)
-        console.print(f"\n[cyan]  Secret scanner completed in {elapsed}s[/cyan]")
-        console.print(f"[cyan]  Hosts scanned: {len(live_targets)} | Dead/skipped: {len(self.dead_hosts)} | Slow: {len(self.slow_hosts)}[/cyan]")
-
-        return self.results
-
-    def _probe_hosts(self, targets):
-        """Quick probe to find which hosts are actually alive"""
-        console.print("[yellow][*] Phase 0: Probing host availability...[/yellow]")
-        live = []
-
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("{task.completed}/{task.total}"),
-            console=console,
-        ) as progress:
-            task = progress.add_task("Probing hosts", total=len(targets))
-
-            for host in targets:
-                if self._is_timed_out():
-                    break
-
-                progress.update(task, description=f"Probing {host[:30]}")
-
-                alive = False
-                for scheme in ["https", "http"]:
-                    try:
-                        resp = self.session.head(
-                            f"{scheme}://{host}",
-                            timeout=3,
-                            allow_redirects=False,
-                        )
-                        if resp.status_code < 600:
-                            alive = True
-                            break
-                    except Exception:
+                if pattern.get('validate'):
+                    if not pattern['validate'](match, context, source_url):
                         continue
 
-                if alive:
-                    live.append(host)
-                else:
-                    self.dead_hosts.add(host)
+                dedup_key = (pattern['name'], matched_value.strip())
 
-                progress.advance(task)
-
-        console.print(f"  [green][+] {len(live)} live hosts, {len(self.dead_hosts)} dead[/green]")
-        return live
-
-    def _scan_pages(self, targets):
-        console.print("[yellow][*] Phase 1: Scanning web pages for secrets...[/yellow]")
-        for host in targets:
-            if self._is_timed_out():
-                break
-            for scheme in ["https", "http"]:
-                url = f"{scheme}://{host}"
-                if url in self.scanned_urls:
-                    continue
-                resp = self._safe_request(url, timeout=8)
-                if resp and resp.status_code == 200:
-                    self.scanned_urls.add(url)
-                    self._scan_content(resp.text, url, "HTML Page")
-                    self._scan_headers(resp.headers, url)
-                    break
-
-    def _find_js_files(self, targets):
-        console.print("[yellow][*] Phase 2: Discovering JavaScript files...[/yellow]")
-        js_patterns = [
-            r'<script[^>]+src=["\']([^"\']+\.js[^"\']*)["\']',
-            r'["\']([^"\']*\.(?:js|min\.js|bundle\.js|chunk\.js)[^"\']*)["\']',
-        ]
-
-        for host in targets[:15]:
-            if self._is_timed_out():
-                break
-            for scheme in ["https", "http"]:
-                resp = self._safe_request(f"{scheme}://{host}", timeout=8)
-                if resp and resp.status_code == 200:
-                    for pattern in js_patterns:
-                        matches = re.findall(pattern, resp.text, re.I)
-                        for js_path in matches[:20]:
-                            js_url = self._resolve_url(f"{scheme}://{host}", js_path)
-                            if js_url and js_url not in self.js_urls:
-                                self.js_urls.add(js_url)
-                                if len(self.js_urls) >= self.MAX_JS_FILES:
-                                    break
-                    break
-
-        console.print(f"  [green][+] Found {len(self.js_urls)} JavaScript URLs[/green]")
-
-    def _scan_js_files(self):
-        if not self.js_urls:
-            return
-        console.print(f"[yellow][*] Scanning {len(self.js_urls)} JavaScript files...[/yellow]")
-
-        scanned = 0
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("{task.completed}/{task.total}"),
-            console=console,
-        ) as progress:
-            task = progress.add_task("Scanning JS", total=len(self.js_urls))
-
-            for js_url in self.js_urls:
-                if self._is_timed_out():
-                    break
-
-                progress.update(task, description=f"JS: {js_url[:40]}")
-                resp = self._safe_request(js_url, timeout=6)
-
-                if resp and resp.status_code == 200 and len(resp.text) > 0:
-                    ct = resp.headers.get("Content-Type", "")
-                    if "javascript" in ct or "text" in ct or js_url.endswith(".js"):
-                        secrets_found = self._scan_content(resp.text, js_url, "JavaScript")
-                        self.results["js_files_scanned"].append({
-                            "url": js_url,
-                            "size": len(resp.text),
-                            "secrets_count": secrets_found,
+                if dedup_key in self.seen_secrets:
+                    existing = self.seen_secrets[dedup_key]
+                    loc_urls = {l['url'] for l in existing['locations']}
+                    if source_url not in loc_urls:
+                        existing['locations'].append({
+                            'url': source_url,
+                            'source_type': source_type,
                         })
-                        if secrets_found > 0:
-                            console.print(f"\n  [bold red][!] {js_url}: {secrets_found} secrets[/bold red]")
-                        scanned += 1
-
-                progress.advance(task)
-
-        console.print(f"  [green][+] Scanned {scanned} JS files[/green]")
-
-    def _check_sensitive_paths(self, targets):
-        console.print("[yellow][*] Phase 3: Checking sensitive file paths...[/yellow]")
-        sensitive_paths = [
-            "/.env", "/.env.local", "/.env.production", "/.env.backup",
-            "/.git/HEAD", "/.git/config",
-            "/config.json", "/config.yaml", "/settings.json",
-            "/wp-config.php.bak", "/wp-config.php.old",
-            "/application.properties", "/application.yml",
-            "/appsettings.json", "/appsettings.Development.json",
-            "/docker-compose.yml",
-            "/phpinfo.php", "/info.php",
-            "/server-status", "/server-info",
-            "/backup.sql", "/dump.sql",
-            "/.htpasswd", "/web.config",
-            "/.DS_Store", "/crossdomain.xml",
-            "/.well-known/security.txt",
-        ]
-
-        for host in targets[:15]:
-            if self._is_timed_out() or self._is_host_dead(host):
-                continue
-
-            checked = 0
-            for path in sensitive_paths:
-                if checked >= self.MAX_SENSITIVE_PATHS_PER_HOST:
-                    break
-                if self._is_timed_out() or self._is_host_dead(host):
-                    break
-
-                url = f"https://{host}{path}"
-                resp = self._safe_request(url, timeout=5)
-                checked += 1
-
-                if resp and resp.status_code == 200 and len(resp.content) > 10:
-                    if not self._is_error_page(resp.text):
-                        self._scan_content(resp.text, url, f"Sensitive File ({path})")
-                        self.results["config_leaks"].append({
-                            "hostname": host,
-                            "path": path,
-                            "url": url,
-                            "size": len(resp.content),
-                            "content_preview": resp.text[:200].replace("\n", " "),
-                        })
-                        console.print(f"  [bold red][!!!] EXPOSED: {url} ({len(resp.content)} bytes)[/bold red]")
-                        self.results["shadow_it_flags"].append({
-                            "type": "Exposed Sensitive File",
-                            "asset": url,
-                            "reason": f"Sensitive file '{path}' is publicly accessible.",
-                        })
-
-    def _discover_apis(self, targets):
-        console.print("[yellow][*] Phase 4: Discovering API endpoints...[/yellow]")
-
-        total_checks = len(targets[:15]) * min(len(self.api_paths), self.MAX_API_PATHS_PER_HOST)
-
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("{task.completed}/{task.total}"),
-            console=console,
-        ) as progress:
-            task = progress.add_task("API Discovery", total=total_checks)
-
-            for host in targets[:15]:
-                if self._is_timed_out() or self._is_host_dead(host):
-                    progress.advance(task, min(len(self.api_paths), self.MAX_API_PATHS_PER_HOST))
                     continue
 
-                host_found = 0
-                checked = 0
+                finding = {
+                    'type': pattern['name'],
+                    'source_url': source_url,
+                    'source_type': source_type,
+                    'masked_value': self._mask_value(matched_value),
+                    'severity': pattern['severity'],
+                    'context': context,
+                    'category': pattern['category'],
+                    '_raw': matched_value,
+                    'locations': [{'url': source_url, 'source_type': source_type}],
+                }
+                self.seen_secrets[dedup_key] = finding
+                findings.append(finding)
 
-                for path in self.api_paths:
-                    if checked >= self.MAX_API_PATHS_PER_HOST:
-                        break
-                    if self._is_timed_out() or self._is_host_dead(host):
-                        break
+        return findings
 
-                    progress.update(task, description=f"{host[:25]}{path[:20]}")
-                    url = f"https://{host}{path}"
-                    resp = self._safe_request(url, timeout=5)
-                    checked += 1
-
-                    if resp:
-                        ct = resp.headers.get("Content-Type", "")
-                        is_api = False
-
-                        if resp.status_code == 200:
-                            if "json" in ct or "xml" in ct or "yaml" in ct:
-                                is_api = True
-                            elif resp.text.strip()[:1] in ("{", "["):
-                                is_api = True
-                            elif path in ["/.git/HEAD", "/.env"] and len(resp.text) > 0:
-                                is_api = True
-                        elif resp.status_code in [401, 403]:
-                            is_api = True
-
-                        if is_api:
-                            auth = "Open" if resp.status_code == 200 else "Auth Required"
-                            entry = {
-                                "hostname": host,
-                                "path": path,
-                                "url": url,
-                                "status_code": resp.status_code,
-                                "content_type": ct,
-                                "auth": auth,
-                                "response_size": len(resp.content),
-                            }
-                            self.results["api_endpoints_found"].append(entry)
-                            host_found += 1
-
-                            color = "bold red" if auth == "Open" else "yellow"
-                            console.print(f"\n  [{color}][+] {url} [{resp.status_code}] ({auth})[/{color}]")
-
-                            if resp.status_code == 200:
-                                self._scan_content(resp.text, url, "API Response")
-                                try:
-                                    data = resp.json()
-                                    self._check_json_secrets(data, url)
-                                except (json.JSONDecodeError, ValueError):
-                                    pass
-
-                    progress.advance(task)
-
-                if host_found > 0:
-                    console.print(f"  [cyan]  {host}: {host_found} endpoints[/cyan]")
-
-    def _check_env_files(self, targets):
-        console.print("[yellow][*] Phase 5: Checking environment files...[/yellow]")
-        env_paths = ["/.env", "/.env.local", "/.env.production", "/.env.staging", "/.env.backup"]
-
-        for host in targets[:15]:
-            if self._is_timed_out() or self._is_host_dead(host):
-                continue
-
-            for path in env_paths:
-                url = f"https://{host}{path}"
-                if url in self.scanned_urls:
-                    continue
-
-                resp = self._safe_request(url, timeout=5)
-                self.scanned_urls.add(url)
-
-                if resp and resp.status_code == 200 and len(resp.text) > 5:
-                    env_pattern = r'^[A-Z][A-Z0-9_]+=.+'
-                    if re.search(env_pattern, resp.text, re.MULTILINE):
-                        console.print(f"  [bold red][!!!] ENV FILE EXPOSED: {url}[/bold red]")
-                        for line in resp.text.split("\n"):
-                            line = line.strip()
-                            if "=" in line and not line.startswith("#"):
-                                key, _, value = line.partition("=")
-                                key = key.strip()
-                                value = value.strip().strip("'\"")
-                                sensitive_keys = [
-                                    "KEY", "SECRET", "TOKEN", "PASSWORD", "PASS",
-                                    "AUTH", "CREDENTIAL", "DATABASE_URL", "DB_",
-                                    "AWS_", "AZURE_", "GCP_", "STRIPE_", "TWILIO_",
-                                    "SENDGRID_", "MAILGUN_", "SLACK_", "GITHUB_",
-                                    "API", "PRIVATE", "ENCRYPTION",
-                                ]
-                                if any(sk in key.upper() for sk in sensitive_keys) and value:
-                                    self.results["env_files"].append({
-                                        "url": url,
-                                        "key": key,
-                                        "value_preview": value[:4] + "****" + value[-2:] if len(value) > 6 else "****",
-                                        "severity": "CRITICAL",
-                                    })
-                                    console.print(f"      [bold red][!] {key} = {value[:4]}****[/bold red]")
-                        self.results["shadow_it_flags"].append({
-                            "type": "Exposed Environment File",
-                            "asset": url,
-                            "reason": "Environment file with secrets is publicly accessible.",
-                        })
-
-    def _scan_content(self, content, source_url, source_type):
-        found = 0
-        for name, pattern in self.secret_patterns.items():
-            try:
-                matches = re.findall(pattern, content)
-                if matches:
-                    for match in matches[:3]:
-                        if isinstance(match, tuple):
-                            match = match[0]
-                        match_str = str(match).strip()
-                        if self._is_false_positive(name, match_str):
-                            continue
-                        masked = self._mask_secret(match_str)
-                        severity = self._get_severity(name)
-                        entry = {
-                            "type": name,
-                            "source_url": source_url,
-                            "source_type": source_type,
-                            "masked_value": masked,
-                            "severity": severity,
-                            "context": self._get_context(content, match_str),
-                        }
-                        if "password" in name.lower() or "credential" in name.lower():
-                            self.results["hardcoded_passwords"].append(entry)
-                        elif "key" in name.lower() or "secret" in name.lower():
-                            self.results["api_keys_found"].append(entry)
-                        elif "token" in name.lower():
-                            self.results["exposed_tokens"].append(entry)
-                        else:
-                            self.results["secrets_found"].append(entry)
-                        found += 1
-                        color = "bold red" if severity == "CRITICAL" else "red" if severity == "HIGH" else "yellow"
-                        console.print(f"  [{color}][!] [{severity}] {name}: {masked} ({source_type})[/{color}]")
-                        self.results["shadow_it_flags"].append({
-                            "type": f"Exposed Secret ({name})",
-                            "asset": source_url,
-                            "reason": f"{name} found in {source_type}. Rotate immediately.",
-                        })
-            except re.error:
-                continue
-        return found
-
-    def _scan_headers(self, headers, url):
-        sensitive_headers = {
-            "X-Powered-By": "Technology disclosure",
-            "Server": "Server disclosure",
-            "X-AspNet-Version": "ASP.NET version disclosure",
-            "X-Debug-Token": "Debug token exposed",
-            "X-Debug-Token-Link": "Debug link exposed",
+    def _check_sensitive_files(self, base_url):
+        env_files = []
+        config_leaks = []
+        paths = {
+            'env': [
+                '/.env', '/.env.local', '/.env.production', '/.env.staging',
+                '/.env.development', '/.env.backup',
+            ],
+            'config': [
+                '/.git/config', '/.git/HEAD', '/.svn/entries',
+                '/config.json', '/config.yaml', '/config.yml',
+                '/wp-config.php.bak', '/phpinfo.php',
+                '/server-status', '/server-info',
+                '/.htpasswd', '/web.config', '/package.json',
+                '/composer.json', '/database.yml',
+            ],
         }
-        for header, desc in sensitive_headers.items():
-            if header in headers:
-                val = headers[header]
-                if header in ["X-Debug-Token", "X-Debug-Token-Link"]:
-                    self.results["secrets_found"].append({
-                        "type": f"Header: {header}",
-                        "source_url": url,
-                        "source_type": "HTTP Header",
-                        "masked_value": val,
-                        "severity": "MEDIUM",
-                        "context": desc,
-                    })
 
-    def _check_json_secrets(self, data, url, depth=0):
-        if depth > 3:
-            return
-        sensitive_fields = [
-            "password", "passwd", "pwd", "secret", "token", "api_key",
-            "apikey", "api_secret", "access_token", "auth_token",
-            "private_key", "encryption_key",
-        ]
-        if isinstance(data, dict):
-            for key, value in data.items():
-                if any(sf in key.lower() for sf in sensitive_fields):
-                    if value and str(value) not in ["", "null", "None", "***", "REDACTED"]:
-                        masked = self._mask_secret(str(value))
-                        self.results["secrets_found"].append({
-                            "type": f"JSON Field: {key}",
-                            "source_url": url,
-                            "source_type": "API JSON Response",
-                            "masked_value": masked,
-                            "severity": "CRITICAL",
-                            "context": f"Sensitive field '{key}' in API response",
-                        })
-                        console.print(f"  [bold red][!!!] API leaking '{key}': {masked}[/bold red]")
-                if isinstance(value, (dict, list)):
-                    self._check_json_secrets(value, url, depth + 1)
-        elif isinstance(data, list):
-            for item in data[:3]:
-                if isinstance(item, (dict, list)):
-                    self._check_json_secrets(item, url, depth + 1)
+        all_checks = []
+        for cat, path_list in paths.items():
+            for p in path_list:
+                all_checks.append((cat, p))
 
-    def _resolve_url(self, base_url, path):
-        try:
-            if path.startswith("//"):
-                return f"https:{path}"
-            elif path.startswith("http"):
-                return path
-            elif path.startswith("/"):
-                parsed = urlparse(base_url)
-                return f"{parsed.scheme}://{parsed.netloc}{path}"
-            else:
-                return urljoin(base_url, path)
-        except Exception:
-            return None
+        def _check_one(cat_path):
+            cat, path = cat_path
+            url = base_url.rstrip('/') + path
+            try:
+                resp = self.session.get(
+                    url, timeout=5, allow_redirects=False
+                )
+                if resp.status_code != 200:
+                    return None
+                body = resp.text.lower()
+                if len(resp.text) < 50:
+                    return None
+                if '<html' in body and any(
+                    x in body for x in
+                    ['not found', '404', 'error page', 'page not found']
+                ):
+                    return None
+                if cat == 'env' and not any(
+                    x in resp.text for x in
+                    ['=', 'export ', 'DB_', 'API_', 'SECRET', 'KEY']
+                ):
+                    return None
+                return (cat, {
+                    'path': path,
+                    'url': url,
+                    'status_code': resp.status_code,
+                    'size': len(resp.text),
+                    'severity': 'CRITICAL' if cat == 'env' else 'HIGH',
+                })
+            except Exception:
+                return None
 
-    def _is_false_positive(self, pattern_name, match):
-        if len(match) < 4:
-            return True
-        fp_values = [
-            "undefined", "null", "none", "true", "false", "example",
-            "your_", "insert_", "paste_", "enter_", "change_me",
-            "xxx", "TODO", "FIXME", "placeholder", "sample",
-            "test1234", "password123", "xxxxxxxx",
-        ]
-        if match.lower() in fp_values or any(fp in match.lower() for fp in fp_values):
-            return True
-        if "Key" in pattern_name and len(match) < 10:
-            return True
-        return False
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            for result in executor.map(_check_one, all_checks):
+                if result:
+                    cat, finding = result
+                    if cat == 'env':
+                        env_files.append(finding)
+                    else:
+                        config_leaks.append(finding)
 
-    def _is_error_page(self, content):
-        error_indicators = [
-            "page not found", "404 not found", "error 404",
-            "does not exist", "access denied", "forbidden",
-        ]
-        content_lower = content.lower()[:500]
-        return any(ind in content_lower for ind in error_indicators)
+        return env_files, config_leaks
 
-    def _mask_secret(self, value):
-        if len(value) <= 8:
-            return value[:2] + "****"
-        return value[:4] + "****" + value[-4:]
+    def run(self, target_domain, subdomains=None, webapp_results=None):
+        console.print(f"\n[bold cyan]{'='*60}[/bold cyan]")
+        console.print(f"[bold cyan]  Module 10: Secret & Credential Scanner - {target_domain}[/bold cyan]")
+        console.print(f"[bold cyan]{'='*60}[/bold cyan]\n")
+        
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    def _get_severity(self, pattern_name):
-        critical = [
-            "AWS", "Azure", "GCP", "Stripe Secret", "Private Key",
-            "Database", "Connection", "Hardcoded Password", "Admin Password",
-            "SSH", "Vault", "Firebase", "MongoDB", "Redis", "FTP", "SMTP",
-            "LDAP", "Default Credential", "PGP",
-        ]
-        high = [
-            "GitHub Token", "Slack", "SendGrid", "Twilio", "Mailgun",
-            "Discord", "Telegram", "Bearer", "JWT", "Generic Secret",
-            "Generic API Key", "PayPal", "Square",
-        ]
-        for c in critical:
-            if c.lower() in pattern_name.lower():
-                return "CRITICAL"
-        for h in high:
-            if h.lower() in pattern_name.lower():
-                return "HIGH"
-        return "MEDIUM"
+        self.visited = set()
+        self.seen_secrets = OrderedDict()
+        all_findings = []
+        crawled_urls = []
+        js_scanned = set()
+        all_env = []
+        all_config = []
 
-    def _get_context(self, content, match):
-        idx = content.find(match)
-        if idx == -1:
-            return ""
-        start = max(0, idx - 40)
-        end = min(len(content), idx + len(match) + 40)
-        ctx = content[start:end].replace("\n", " ").strip()
-        return f"...{ctx}..."
+        # ── Build target list with dedup ──
+        max_subs = self.config.get("SECRET_MAX_TARGETS", 150)
+        seen_hosts = set()
+        targets = []
 
-    def _generate_summary(self):
-        total = (
-            len(self.results["secrets_found"])
-            + len(self.results["api_keys_found"])
-            + len(self.results["hardcoded_passwords"])
-            + len(self.results["exposed_tokens"])
-        )
+        # Add root domain
+        root = target_domain.strip().lower().rstrip('.')
+        seen_hosts.add(root)
+        targets.append(root)
 
-        table = Table(title="Secret Scanner Summary")
-        table.add_column("Category", style="cyan")
-        table.add_column("Count", style="bold white")
-        table.add_column("Severity", style="bold")
-        table.add_row("API Keys", str(len(self.results["api_keys_found"])), "[red]CRITICAL[/red]")
-        table.add_row("Hardcoded Passwords", str(len(self.results["hardcoded_passwords"])), "[red]CRITICAL[/red]")
-        table.add_row("Exposed Tokens", str(len(self.results["exposed_tokens"])), "[bold red]HIGH[/bold red]")
-        table.add_row("Other Secrets", str(len(self.results["secrets_found"])), "[yellow]MEDIUM[/yellow]")
-        table.add_row("Config/Env Leaks", str(len(self.results["config_leaks"])), "[red]CRITICAL[/red]")
-        table.add_row("Env File Secrets", str(len(self.results["env_files"])), "[red]CRITICAL[/red]")
-        table.add_row("API Endpoints", str(len(self.results["api_endpoints_found"])), "[cyan]INFO[/cyan]")
-        table.add_row("JS Files Scanned", str(len(self.results["js_files_scanned"])), "[cyan]INFO[/cyan]")
-        table.add_row("[bold]TOTAL SECRETS[/bold]", f"[bold]{total}[/bold]", "")
-        console.print(table)
+        # Add subdomains (handle both strings and dicts)
+        if subdomains:
+            for sub in subdomains:
+                if isinstance(sub, dict):
+                    sub = sub.get('subdomain', sub.get('domain',
+                          sub.get('name', sub.get('host', ''))))
+                if not isinstance(sub, str):
+                    try:
+                        sub = str(sub)
+                    except Exception:
+                        continue
+                sub = sub.strip().lower().rstrip('.')
+                if sub and sub not in seen_hosts:
+                    seen_hosts.add(sub)
+                    targets.append(sub)
+                if len(targets) >= max_subs + 1:
+                    break
 
-    def _next_steps(self):
+        # Extract additional URLs from webapp results
+        extra_urls = []
+        if webapp_results and isinstance(webapp_results, dict):
+            for key in ('urls_found', 'crawled_urls', 'api_endpoints', 'endpoints'):
+                urls = webapp_results.get(key, [])
+                if isinstance(urls, list):
+                    for u in urls:
+                        if isinstance(u, str) and u.startswith('http'):
+                            extra_urls.append(u)
+                        elif isinstance(u, dict) and u.get('url', '').startswith('http'):
+                            extra_urls.append(u['url'])
+
+        # ── Resolve hostnames to working URLs (HTTPS → HTTP fallback) ──
+        print(f"\n{'='*60}")
+        print(f"  SECRET SCANNER - Resolving {len(targets)} host(s)")
+        print(f"{'='*60}")
+
+        target_urls = []
+        unreachable = []
+
+        def _resolve_one(host):
+            if host.startswith('http'):
+                return (host, host, 'PROVIDED')
+            resolved = self._resolve_url(host)
+            if resolved:
+                scheme = 'HTTPS' if resolved.startswith('https') else 'HTTP'
+                return (host, resolved, scheme)
+            return (host, None, None)
+
+        with ThreadPoolExecutor(max_workers=15) as executor:
+            futures = [executor.submit(_resolve_one, t) for t in targets]
+            for future in as_completed(futures):
+                host, url, scheme = future.result()
+                if url:
+                    target_urls.append(url)
+                    if scheme != 'PROVIDED':
+                        print(f"  [+] {host} -> {url} ({scheme})")
+                else:
+                    unreachable.append(host)
+
+        # Add extra URLs from webapp scanner
+        seen_urls = set(target_urls)
+        for u in extra_urls[:20]:
+            if u not in seen_urls:
+                target_urls.append(u)
+                seen_urls.add(u)
+
+        if unreachable:
+            print(f"\n  [-] {len(unreachable)} host(s) unreachable:")
+            for h in unreachable[:10]:
+                print(f"      - {h}")
+            if len(unreachable) > 10:
+                print(f"      ... +{len(unreachable) - 10} more")
+
+        print(f"\n{'='*60}")
+        print(f"  SECRET SCANNER - Scanning {len(target_urls)} live target(s)")
+        print(f"{'='*60}")
+
+        if not target_urls:
+            print("  [!] No reachable targets found. Check domain/subdomains.")
+            return {
+                'credentials_found': [], 'api_keys_found': [],
+                'hardcoded_passwords': [], 'exposed_tokens': [],
+                'js_files_scanned': [], 'api_endpoints_found': [],
+                'env_files': [], 'config_leaks': [],
+                'files_scanned': [], 'crawled_urls': [],
+                'false_positives_filtered': 0, 'unique_secrets_count': 0,
+                'total_occurrences': 0, 'next_steps': [],
+                'shadow_it_flags': [],
+            }
+
+        for target_url in target_urls:
+            print(f"\n[*] Scanning: {target_url}")
+            html = self._fetch_page(target_url)
+            if not html:
+                print(f"  [-] Could not fetch {target_url}")
+                continue
+
+            self.visited.add(target_url)
+            findings = self._scan_text(html, target_url, "HTML Page")
+            all_findings.extend(findings)
+
+            js_files = self._extract_js_files(html, target_url)
+            for js_url in js_files:
+                if js_url not in js_scanned:
+                    js_scanned.add(js_url)
+                    jsc = self._fetch_page(js_url)
+                    if jsc:
+                        jf = self._scan_text(jsc, js_url, "JavaScript File")
+                        all_findings.extend(jf)
+                        time.sleep(0.15)
+
+            links = self._extract_links(html, target_url)
+            count = 0
+            for link in links:
+                if count >= self.max_crawl:
+                    break
+                if link in self.visited:
+                    continue
+                self.visited.add(link)
+                lhtml = self._fetch_page(link)
+                if not lhtml:
+                    continue
+                crawled_urls.append(link)
+                count += 1
+                pf = self._scan_text(lhtml, link, "Crawled Page")
+                all_findings.extend(pf)
+
+                pjs = self._extract_js_files(lhtml, link)
+                for js_url in pjs:
+                    if js_url not in js_scanned:
+                        js_scanned.add(js_url)
+                        jsc = self._fetch_page(js_url)
+                        if jsc:
+                            jf = self._scan_text(jsc, js_url, "JavaScript File")
+                            all_findings.extend(jf)
+                time.sleep(0.25)
+
+            ef, cl = self._check_sensitive_files(target_url)
+            all_env.extend(ef)
+            all_config.extend(cl)
+
+        # ── Build results ──
+        unique = list(self.seen_secrets.values())
+        creds, keys, passwords, tokens = [], [], [], []
+        shadow_flags = []
+
+        for s in unique:
+            out = {
+                'type': s['type'],
+                'source_url': s['source_url'],
+                'source_type': s['source_type'],
+                'masked_value': s['masked_value'],
+                'severity': s['severity'],
+                'context': s['context'],
+                'locations': s['locations'],
+                'occurrence_count': len(s['locations']),
+            }
+            cat = s['category']
+            if cat == 'credentials_found':
+                creds.append(out)
+            elif cat == 'api_keys_found':
+                keys.append(out)
+            elif cat == 'hardcoded_passwords':
+                passwords.append(out)
+            elif cat == 'exposed_tokens':
+                tokens.append(out)
+
+            if s['severity'] in ('HIGH', 'CRITICAL'):
+                shadow_flags.append({
+                    'type': f"Exposed Secret ({s['type']})",
+                    'asset': s['source_url'],
+                    'reason': f"{s['type']} found across {len(s['locations'])} page(s). Rotate immediately.",
+                    'module': 'secret_scanner',
+                })
+
+        total_raw = sum(len(s['locations']) for s in unique)
+        fp_filtered = total_raw - len(unique)
+
+        self._print_summary(unique, fp_filtered)
+
+        next_steps = self._build_next_steps(keys, tokens, creds, passwords)
+
+        return {
+            'credentials_found': creds,
+            'api_keys_found': keys,
+            'hardcoded_passwords': passwords,
+            'exposed_tokens': tokens,
+            'js_files_scanned': list(js_scanned),
+            'api_endpoints_found': [],
+            'env_files': all_env,
+            'config_leaks': all_config,
+            'files_scanned': list(self.visited),
+            'crawled_urls': crawled_urls,
+            'false_positives_filtered': fp_filtered,
+            'unique_secrets_count': len(unique),
+            'total_occurrences': total_raw,
+            'next_steps': next_steps,
+            'shadow_it_flags': shadow_flags,
+        }
+
+    # ──────────────────────────────────────────────
+    #  REPORTING
+    # ──────────────────────────────────────────────
+
+    def _build_next_steps(self, keys, tokens, creds, passwords):
         steps = []
-        if self.results["api_keys_found"]:
-            steps.append({
-                "action": "Rotate Exposed API Keys",
-                "description": f"{len(self.results['api_keys_found'])} API keys found. Rotate ALL immediately.",
-                "priority": "CRITICAL",
-            })
-        if self.results["hardcoded_passwords"]:
-            steps.append({
-                "action": "Change Hardcoded Passwords",
-                "description": f"{len(self.results['hardcoded_passwords'])} hardcoded passwords. Remove from code, use vault.",
-                "priority": "CRITICAL",
-            })
-        if self.results["env_files"]:
-            steps.append({
-                "action": "Remove Exposed Env Files",
-                "description": f"{len(self.results['env_files'])} env secrets exposed. Block access and rotate.",
-                "priority": "CRITICAL",
-            })
-        if self.results["config_leaks"]:
-            steps.append({
-                "action": "Secure Config Files",
-                "description": f"{len(self.results['config_leaks'])} config files publicly accessible.",
-                "priority": "CRITICAL",
-            })
-        if self.results["exposed_tokens"]:
-            steps.append({
-                "action": "Revoke Exposed Tokens",
-                "description": f"{len(self.results['exposed_tokens'])} tokens found. Revoke and reissue.",
-                "priority": "HIGH",
-            })
-        open_apis = [e for e in self.results["api_endpoints_found"] if e["auth"] == "Open"]
-        if open_apis:
-            steps.append({
-                "action": "Secure Open APIs",
-                "description": f"{len(open_apis)} unauthenticated API endpoints. Add auth.",
-                "priority": "HIGH",
-            })
-        steps.append({
-            "action": "Implement Secret Scanning",
-            "description": "Set up pre-commit hooks with trufflehog/gitleaks.",
-            "priority": "HIGH",
-        })
-        self.results["next_steps"] = steps
+        crit_keys = [k for k in keys if k['severity'] == 'CRITICAL']
+        if crit_keys:
+            steps.append({'action': 'Rotate Exposed API Keys',
+                          'description': f"{len(crit_keys)} critical API key(s) found.", 'priority': 'CRITICAL'})
+        crit_tok = [t for t in tokens if t['severity'] in ('HIGH', 'CRITICAL')]
+        if crit_tok:
+            steps.append({'action': 'Revoke Exposed Tokens',
+                          'description': f"{len(crit_tok)} high/critical token(s) found.", 'priority': 'HIGH'})
+        if creds:
+            steps.append({'action': 'Rotate Exposed Credentials',
+                          'description': f"{len(creds)} credential(s) found.", 'priority': 'CRITICAL'})
+        if passwords:
+            steps.append({'action': 'Remove Hardcoded Passwords',
+                          'description': f"{len(passwords)} hardcoded password(s) found.", 'priority': 'CRITICAL'})
+        if any([keys, tokens, creds, passwords]):
+            steps.append({'action': 'Implement Secret Scanning in CI/CD',
+                          'description': 'Use trufflehog/gitleaks in CI.', 'priority': 'HIGH'})
+        return steps
+
+    def _print_summary(self, unique, fp_filtered):
+        print(f"\n{'='*80}")
+        print(f"  SECRET SCAN RESULTS (DEDUPLICATED)")
+        print(f"{'='*80}")
+        print(f"  Unique secrets: {len(unique)}  |  Duplicates filtered: {fp_filtered}")
+        print(f"{'='*80}")
+        if not unique:
+            print("  No secrets found.\n")
+            return
+        sev_order = {'CRITICAL': 0, 'HIGH': 1, 'MEDIUM': 2, 'LOW': 3, 'INFO': 4}
+        tc = {}
+        for s in unique:
+            k = (s['type'], s['severity'])
+            tc[k] = tc.get(k, 0) + 1
+        print(f"\n  {'Type':<30} {'Severity':<10} {'Unique':<8} {'Pages':<8}")
+        print(f"  {'-'*30} {'-'*10} {'-'*8} {'-'*8}")
+        for (t, sv), c in sorted(tc.items(), key=lambda x: sev_order.get(x[0][1], 5)):
+            pages = sum(len(s['locations']) for s in unique if s['type'] == t)
+            print(f"  {t:<30} {sv:<10} {c:<8} {pages:<8}")
+        print(f"\n  {'='*80}")
+        print(f"  DETAILED FINDINGS")
+        print(f"  {'='*80}")
+        icons = {'CRITICAL': '[!!]', 'HIGH': '[!]', 'MEDIUM': '[~]', 'LOW': '[.]', 'INFO': '[i]'}
+        for i, s in enumerate(sorted(unique, key=lambda x: sev_order.get(x['severity'], 5)), 1):
+            icon = icons.get(s['severity'], '[?]')
+            print(f"\n  {icon} #{i}: {s['type']} ({s['severity']})")
+            print(f"      Value: {s['masked_value']}")
+            print(f"      Found on {len(s['locations'])} page(s):")
+            for loc in s['locations'][:5]:
+                print(f"        - {loc['url']} ({loc['source_type']})")
+            if len(s['locations']) > 5:
+                print(f"        ... +{len(s['locations'])-5} more")
+        print(f"\n{'='*80}\n")
