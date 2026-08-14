@@ -17,3 +17,11 @@ python3 mobscan.py app-release.apk
 
 # With baseline suppression (first run seeds it, later runs respect it)
 python3 mobscan.py app-release.apk --baseline baseline.json --auto-suppress
+
+
+Connect to Android in Corellium:
+python3 mobscan.py app.apk \
+    --dynamic \
+    --dyn-target com.example.app \
+    --dyn-host <CORELLIUM_DEVICE_IP> \
+    --dyn-duration 45
