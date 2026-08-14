@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-mobscan.py v4 - Unified APK/IPA vulnerability scanner.
+mobscan.py v4.1 - Unified APK/IPA vulnerability scanner.
 
 Includes:
   * Static analysis (secrets, manifest, WebView bridge, network config, iOS ATS,
@@ -22,8 +22,10 @@ QUICK START
     python3 mobscan.py app.apk
     python3 mobscan.py MyApp.ipa --format word --output report.docx
 
-    # Static + dynamic (device/emulator/Corellium with frida-server running)
-    python3 mobscan.py app.apk --dynamic --dyn-target com.example.app
+    # Static + dynamic, LOCAL USB/adb device (do NOT pass --dyn-host):
+    python3 mobscan.py app.apk --dynamic --dyn-target com.example.app --dyn-duration 45
+
+    # Static + dynamic, REMOTE device (Corellium VPN IP):
     python3 mobscan.py MyApp.ipa --dynamic --dyn-target "AppName" \
             --dyn-host 10.11.1.1 --dyn-duration 45
 
@@ -281,7 +283,7 @@ def validate_secret_format(check_id: str, value: str) -> Optional[Signal]:
             except Exception:
                 return Signal(-1.0, "JWT-shaped but header does not decode to valid JSON.")
     if "PRIVATE_KEY" in cid:
-        return Signal(+4.0, "Literal PEM private-key block present — very high signal.")
+        return Signal(+4.0, "Literal PEM private-key block present -- very high signal.")
     return None
 
 
@@ -348,7 +350,7 @@ class ValidationEngine:
         sig = []
         path = ctx.file_path or ""
         if TEST_PATH_RX.search(path):
-            sig.append(Signal(-3.0, "In test/mock/sample/debug path — low production impact."))
+            sig.append(Signal(-3.0, "In test/mock/sample/debug path -- low production impact."))
         if GENERATED_PATH_RX.search(path):
             sig.append(Signal(-2.0, "In generated/build artifact (R.java/BuildConfig/etc.)."))
         sdk = classify_sdk(ctx.package or path)
@@ -364,7 +366,7 @@ class ValidationEngine:
     def _reachability_signals(self, ctx: FindingContext) -> List[Signal]:
         sig = []
         if ctx.runtime_observed:
-            sig.append(Signal(+4.0, "Observed live at runtime via Frida — behavior is real, not inferred."))
+            sig.append(Signal(+4.0, "Observed live at runtime via Frida -- behavior is real, not inferred."))
         if ctx.declared_only is True:
             sig.append(Signal(-1.5, "Declared but appears unreferenced (dead constant)."))
         elif ctx.declared_only is False:
@@ -390,16 +392,16 @@ class ValidationEngine:
             sig.append(Signal(-4.0, "Contains placeholder/template markers."))
         if val:
             if looks_like_uuid(val):
-                sig.append(Signal(-2.0, "Value is a UUID — usually an identifier, not a secret."))
+                sig.append(Signal(-2.0, "Value is a UUID -- usually an identifier, not a secret."))
             if looks_like_bare_hash(val) or NON_SECRET_HINT_RX.search(raw):
                 sig.append(Signal(-2.5, "Value looks like a hash/checksum, not a credential."))
             dr = dictionary_ratio(val)
             if dr > 0.5:
-                sig.append(Signal(-2.0, f"Mostly dictionary words ({dr:.0%}) — likely config string."))
+                sig.append(Signal(-2.0, f"Mostly dictionary words ({dr:.0%}) -- likely config string."))
             ent, note = try_decode_entropy(val)
             if ent < 3.0:
                 sig.append(Signal(-2.0, f"Low effective entropy ({ent:.2f})" +
-                                        (f"; {note}" if note else "") + " — unlikely live key."))
+                                        (f"; {note}" if note else "") + " -- unlikely live key."))
             elif ent >= 4.0:
                 sig.append(Signal(+1.5, f"High entropy ({ent:.2f}) consistent with a real secret."))
             fmt = validate_secret_format(ctx.extra.get("check_id", ""), val)
@@ -995,7 +997,7 @@ def check_ios_ats(plist: dict, loc: str) -> List[Finding]:
     if ats.get("NSAllowsArbitraryLoads") is True:
         if bool(ats.get("NSExceptionDomains")):
             sev, conf = Severity.LOW, Confidence.NEEDS_REVIEW
-            validation = ("Arbitrary loads enabled but exception domains defined — on iOS 10+ "
+            validation = ("Arbitrary loads enabled but exception domains defined -- on iOS 10+ "
                           "scoped exceptions may override. Review the domain list.")
         else:
             sev, conf = Severity.HIGH, Confidence.CONFIRMED
@@ -1052,14 +1054,14 @@ def check_ios_encryption(binary: str, root: str) -> Tuple[Optional[Finding], boo
             check_id="IOS_NOT_ENCRYPTED", title="Binary not FairPlay-encrypted (cryptid=0)",
             severity=Severity.INFO, confidence=Confidence.CONFIRMED,
             location=rel, evidence="cryptid 0",
-            description="Binary is decrypted — static analysis reliable.",
+            description="Binary is decrypted -- static analysis reliable.",
             validation="Good for analysis.",
         ), False
     return Finding(
         check_id="IOS_ENCRYPTED", title="Binary FairPlay-encrypted (cryptid=1)",
         severity=Severity.INFO, confidence=Confidence.CONFIRMED,
         location=rel, evidence="cryptid 1",
-        description="Encrypted binary — static findings incomplete.",
+        description="Encrypted binary -- static findings incomplete.",
         validation="Decrypt with frida-ios-dump, then re-scan.",
     ), True
 
@@ -1091,7 +1093,7 @@ def check_ios_binary_hardening(binary: str, root: str) -> List[Finding]:
             check_id="IOS_NO_PIE", title="Binary not compiled with PIE",
             severity=Severity.MEDIUM, confidence=Confidence.CONFIRMED,
             location=rel, evidence="MH_PIE flag absent",
-            description="No Position Independent Executable — weakens ASLR.",
+            description="No Position Independent Executable -- weakens ASLR.",
             validation="Parsed from Mach-O header flags.",
             remediation="Compile with -fPIE -pie.",
         ))
@@ -1147,113 +1149,147 @@ def _read_strings(binary: str, limit: int = 30_000_000) -> Optional[str]:
 ANDROID_HOOKS = r"""
 'use strict';
 function F(id, sev, title, ev, det){ send({t:'finding',check_id:id,severity:sev,title:title,evidence:ev,detail:det}); }
-Java.perform(function () {
-    try {
-        var DB = Java.use('android.database.sqlite.SQLiteDatabase');
-        ['rawQuery','execSQL'].forEach(function(m){
-            DB[m].overloads.forEach(function(ov){
-                ov.implementation = function(){
-                    var sql = arguments[0]?arguments[0].toString():'';
-                    if ((/'.*\+.*'/.test(sql)) || (/=\s*'[^?]/.test(sql) && sql.indexOf('?')===-1)) {
-                        F('DYN_SQLI','HIGH','Potential SQL injection (dynamic string query)',sql.substring(0,200),
-                          'Query executed without parameterized placeholders (?). Input reaching this is injectable.');
-                    }
-                    return ov.apply(this,arguments);
-                };
+function S(msg){ send({t:'status', msg: msg}); }
+
+if (typeof Java === 'undefined') {
+    S('FATAL: Java bridge undefined -> you are on Frida 17+ (Java global removed). '
+      + 'Downgrade host AND device frida to a matching 16.x version.');
+} else if (!Java.available) {
+    S('FATAL: Java runtime not available -> attached to a non-Java process? '
+      + 'Confirm you targeted the app, not a native daemon.');
+} else {
+    Java.perform(function () {
+        var installed = [];
+        try {
+            var DB = Java.use('android.database.sqlite.SQLiteDatabase');
+            ['rawQuery','execSQL'].forEach(function(m){
+                DB[m].overloads.forEach(function(ov){
+                    ov.implementation = function(){
+                        var sql = arguments[0]?arguments[0].toString():'';
+                        if ((/'.*\+.*'/.test(sql)) || (/=\s*'[^?]/.test(sql) && sql.indexOf('?')===-1))
+                            F('DYN_SQLI','HIGH','Potential SQL injection (dynamic string query)',sql.substring(0,200),
+                              'Query executed without parameterized placeholders (?). Input reaching this is injectable.');
+                        return ov.apply(this,arguments);
+                    };
+                });
             });
-        });
-    } catch(e){}
-    try {
-        var WV = Java.use('android.webkit.WebView');
-        ['loadUrl','evaluateJavascript','loadData','loadDataWithBaseURL'].forEach(function(m){
-            if(!WV[m]) return;
-            WV[m].overloads.forEach(function(ov){
-                ov.implementation = function(){
-                    var a = arguments[0]?arguments[0].toString():'';
-                    if(m==='loadUrl' && a.indexOf('javascript:')===0)
-                        F('DYN_JS_INJECT','MEDIUM','Runtime javascript: URL loaded into WebView',a.substring(0,200),
-                          'javascript: scheme executed at runtime -- injection vector if arg is tainted.');
-                    if(a.indexOf('http://')===0)
-                        F('DYN_CLEARTEXT_LOAD','HIGH','WebView loaded cleartext HTTP at runtime',a.substring(0,200),
-                          'Live HTTP load enables MitM JS injection into the WebView bridge.');
-                    return ov.apply(this,arguments);
-                };
+            installed.push('SQLite');
+        } catch(e){ S('hook FAILED SQLite: ' + e); }
+
+        try {
+            var WV = Java.use('android.webkit.WebView');
+            ['loadUrl','evaluateJavascript','loadData','loadDataWithBaseURL'].forEach(function(m){
+                if(!WV[m]) return;
+                WV[m].overloads.forEach(function(ov){
+                    ov.implementation = function(){
+                        var a = arguments[0]?arguments[0].toString():'';
+                        if(m==='loadUrl' && a.indexOf('javascript:')===0)
+                            F('DYN_JS_INJECT','MEDIUM','Runtime javascript: URL loaded into WebView',a.substring(0,200),
+                              'javascript: scheme executed at runtime -- injection vector if arg is tainted.');
+                        if(a.indexOf('http://')===0)
+                            F('DYN_CLEARTEXT_LOAD','HIGH','WebView loaded cleartext HTTP at runtime',a.substring(0,200),
+                              'Live HTTP load enables MitM JS injection into the WebView bridge.');
+                        return ov.apply(this,arguments);
+                    };
+                });
             });
-        });
-    } catch(e){}
-    var pinning=false;
-    try {
-        var CP = Java.use('okhttp3.CertificatePinner');
-        CP.check.overload('java.lang.String','java.util.List').implementation = function(h,c){
-            pinning=true;
-            F('DYN_PINNING_PRESENT','INFO','OkHttp certificate pinning active','okhttp3.CertificatePinner.check('+h+')',
-              'Pinning enforced for '+h+'. Bypassable via this same hook.');
-            return this.check(h,c);
-        };
-    } catch(e){}
-    try {
-        var TM = Java.use('com.android.org.conscrypt.TrustManagerImpl');
-        TM.checkTrustedRecursive.implementation = function(){
-            pinning=true;
-            F('DYN_PINNING_CONSCRYPT','INFO','Platform pinning (Conscrypt) invoked','TrustManagerImpl.checkTrustedRecursive',
-              'NSC pinning in force but bypassable by hooking this method.');
-            return this.checkTrustedRecursive.apply(this,arguments);
-        };
-    } catch(e){}
-    setTimeout(function(){
-        if(!pinning)
-            F('DYN_NO_PINNING','MEDIUM','No certificate pinning observed at runtime','no pinning APIs invoked',
-              'App made TLS connections without observed pinning -- MitM-vulnerable with a trusted CA. Confirm via proxy.');
-    },15000);
-    try {
-        var Ed = Java.use('android.content.SharedPreferences$Editor');
-        Ed.putString.implementation = function(k,v){
-            var kk=k?k.toString():'', vv=v?v.toString():'';
-            if(/(?:token|password|secret|pin|ssn|card|key)/i.test(kk) || /eyJ[A-Za-z0-9_-]{10,}\./.test(vv))
-                F('DYN_INSECURE_STORAGE','HIGH','Sensitive value written to SharedPreferences (plaintext)',
-                  kk+'='+vv.substring(0,40),'Sensitive data stored unencrypted. Use EncryptedSharedPreferences/Keystore.');
-            return this.putString(k,v);
-        };
-    } catch(e){}
-    try {
-        var C = Java.use('javax.crypto.Cipher');
-        C.getInstance.overload('java.lang.String').implementation = function(t){
-            var tt=t.toString();
-            if(/DES|RC4|ECB|MD5/i.test(tt))
-                F('DYN_WEAK_CRYPTO','MEDIUM','Weak cryptographic transformation used',tt,
-                  'Insecure algorithm/mode ('+tt+'). Use AES/GCM with random IV.');
-            return this.getInstance(t);
-        };
-    } catch(e){}
-    try {
-        var In = Java.use('android.content.Intent');
-        In.getData.implementation = function(){
-            var u=this.getData();
-            if(u){ var s=u.toString();
-                if(/['"<>]|javascript:|file:\/\//i.test(s))
-                    F('DYN_DEEPLINK_INJECT','MEDIUM','Suspicious deep-link/intent data received',s.substring(0,200),
-                      'Incoming URI contains injection-adjacent chars/schemes. Verify handler sanitizes this.');
-            }
-            return u;
-        };
-    } catch(e){}
-    send({t:'status',msg:'Android hooks installed'});
-});
+            installed.push('WebView');
+        } catch(e){ S('hook FAILED WebView: ' + e); }
+
+        var pinning=false;
+        try {
+            var CP = Java.use('okhttp3.CertificatePinner');
+            CP.check.overload('java.lang.String','java.util.List').implementation = function(h,c){
+                pinning=true;
+                F('DYN_PINNING_PRESENT','INFO','OkHttp certificate pinning active','okhttp3.CertificatePinner.check('+h+')',
+                  'Pinning enforced for '+h+'. Bypassable via this same hook.');
+                return this.check(h,c);
+            };
+            installed.push('OkHttpPinning');
+        } catch(e){ /* okhttp not present - normal */ }
+
+        try {
+            var TM = Java.use('com.android.org.conscrypt.TrustManagerImpl');
+            TM.checkTrustedRecursive.implementation = function(){
+                pinning=true;
+                F('DYN_PINNING_CONSCRYPT','INFO','Platform pinning (Conscrypt) invoked','TrustManagerImpl.checkTrustedRecursive',
+                  'NSC pinning in force but bypassable by hooking this method.');
+                return this.checkTrustedRecursive.apply(this,arguments);
+            };
+            installed.push('ConscryptTrust');
+        } catch(e){ /* conscrypt impl differs by OS version - normal */ }
+
+        setTimeout(function(){
+            if(!pinning)
+                F('DYN_NO_PINNING','MEDIUM','No certificate pinning observed at runtime','no pinning APIs invoked',
+                  'App made TLS connections without observed pinning -- MitM-vulnerable with a trusted CA. Confirm via proxy.');
+        },15000);
+
+        try {
+            var Ed = Java.use('android.content.SharedPreferences$Editor');
+            Ed.putString.implementation = function(k,v){
+                var kk=k?k.toString():'', vv=v?v.toString():'';
+                if(/(?:token|password|secret|pin|ssn|card|key)/i.test(kk) || /eyJ[A-Za-z0-9_-]{10,}\./.test(vv))
+                    F('DYN_INSECURE_STORAGE','HIGH','Sensitive value written to SharedPreferences (plaintext)',
+                      kk+'='+vv.substring(0,40),'Sensitive data stored unencrypted. Use EncryptedSharedPreferences/Keystore.');
+                return this.putString(k,v);
+            };
+            installed.push('SharedPrefs');
+        } catch(e){ S('hook FAILED SharedPrefs: ' + e); }
+
+        try {
+            var C = Java.use('javax.crypto.Cipher');
+            C.getInstance.overload('java.lang.String').implementation = function(t){
+                var tt=t.toString();
+                if(/DES|RC4|ECB|MD5/i.test(tt))
+                    F('DYN_WEAK_CRYPTO','MEDIUM','Weak cryptographic transformation used',tt,
+                      'Insecure algorithm/mode ('+tt+'). Use AES/GCM with random IV.');
+                return this.getInstance(t);
+            };
+            installed.push('Cipher');
+        } catch(e){ S('hook FAILED Cipher: ' + e); }
+
+        try {
+            var In = Java.use('android.content.Intent');
+            In.getData.implementation = function(){
+                var u=this.getData();
+                if(u){ var s=u.toString();
+                    if(/['"<>]|javascript:|file:\/\//i.test(s))
+                        F('DYN_DEEPLINK_INJECT','MEDIUM','Suspicious deep-link/intent data received',s.substring(0,200),
+                          'Incoming URI contains injection-adjacent chars/schemes. Verify handler sanitizes this.');
+                }
+                return u;
+            };
+            installed.push('Intent');
+        } catch(e){ S('hook FAILED Intent: ' + e); }
+
+        S('Android hooks installed -> ' + installed.join(', '));
+    });
+}
 """
 
 IOS_HOOKS = r"""
 'use strict';
 function F(id,sev,title,ev,det){ send({t:'finding',check_id:id,severity:sev,title:title,evidence:ev,detail:det}); }
-if (ObjC.available) {
+function S(msg){ send({t:'status', msg: msg}); }
+
+if (typeof ObjC === 'undefined') {
+    S('FATAL: ObjC bridge undefined -> you are on Frida 17+ (ObjC global removed). '
+      + 'Downgrade host AND device frida to a matching 16.x version.');
+} else if (!ObjC.available) {
+    S('FATAL: ObjC runtime not available -> wrong process?');
+} else {
+    var installed = [];
     try {
         var prep = Module.findExportByName(null,'sqlite3_prepare_v2');
-        if(prep) Interceptor.attach(prep,{ onEnter:function(a){
+        if(prep){ Interceptor.attach(prep,{ onEnter:function(a){
             var sql=a[1].readUtf8String();
             if(sql && (/'.*%@.*'|'.*\+.*'/.test(sql)) && sql.indexOf('?')===-1)
                 F('DYN_SQLI','HIGH','Potential SQL injection (unparameterized query)',sql.substring(0,200),
                   'Query built via string interpolation without bound parameters (?).');
-        }});
-    } catch(e){}
+        }}); installed.push('sqlite'); }
+    } catch(e){ S('hook FAILED sqlite: ' + e); }
+
     var pinning=false;
     try {
         if(ObjC.classes.AFSecurityPolicy){
@@ -1262,22 +1298,28 @@ if (ObjC.available) {
                     F('DYN_PINNING_PRESENT','INFO','AFNetworking certificate pinning active','AFSecurityPolicy.evaluateServerTrust',
                       'Pinning enforced via AFNetworking -- bypassable by hooking this method.'); }
             });
+            installed.push('AFNetworking');
         }
         if(ObjC.classes.TSKPinningValidator){ pinning=true;
             F('DYN_PINNING_PRESENT','INFO','TrustKit pinning present','TSKPinningValidator',
-              'TrustKit enforces pinning -- hookable/bypassable at runtime.'); }
-    } catch(e){}
+              'TrustKit enforces pinning -- hookable/bypassable at runtime.');
+            installed.push('TrustKit'); }
+    } catch(e){ S('hook FAILED pinning: ' + e); }
+
     try {
         var se = Module.findExportByName('Security','SecTrustEvaluateWithError');
-        if(se) Interceptor.attach(se,{ onLeave:function(r){ pinning=true;
+        if(se){ Interceptor.attach(se,{ onLeave:function(r){ pinning=true;
             F('DYN_PINNING_SECTRUST','INFO','SecTrustEvaluate invoked (custom trust check)','Security.SecTrustEvaluateWithError',
               'Custom trust evaluation present. Bypassable by forcing success.'); }});
-    } catch(e){}
+            installed.push('SecTrust'); }
+    } catch(e){ S('hook FAILED SecTrust: ' + e); }
+
     setTimeout(function(){
         if(!pinning)
             F('DYN_NO_PINNING','MEDIUM','No certificate pinning observed at runtime','no pinning APIs invoked',
               'No pinning APIs fired during TLS. Confirm via proxy; if traffic flows through a trusted proxy CA, MitM-vulnerable.');
     },15000);
+
     try {
         var UD = ObjC.classes.NSUserDefaults;
         Interceptor.attach(UD['- setObject:forKey:'].implementation,{ onEnter:function(a){
@@ -1286,20 +1328,27 @@ if (ObjC.available) {
                 F('DYN_INSECURE_STORAGE','HIGH','Sensitive value written to NSUserDefaults (plaintext)',
                   k+'='+v.substring(0,40),'NSUserDefaults is unencrypted plist storage. Use Keychain for secrets.');
         }});
-    } catch(e){}
+        installed.push('NSUserDefaults');
+    } catch(e){ S('hook FAILED NSUserDefaults: ' + e); }
+
     try {
         var cc = Module.findExportByName('libcommonCrypto.dylib','CCCrypt') ||
                  Module.findExportByName(null,'CCCrypt');
-        if(cc) Interceptor.attach(cc,{ onEnter:function(a){
+        if(cc){ Interceptor.attach(cc,{ onEnter:function(a){
             var alg=a[1].toInt32(), opts=a[2].toInt32();
             if(alg===1||alg===4||(opts&2))
                 F('DYN_WEAK_CRYPTO','MEDIUM','Weak crypto via CommonCrypto','CCCrypt alg='+alg+' opts='+opts,
                   'DES/RC4 or ECB mode in use. Switch to AES-GCM with random IV.');
-        }});
-    } catch(e){}
-    send({t:'status',msg:'iOS hooks installed'});
+        }}); installed.push('CCCrypt'); }
+    } catch(e){ S('hook FAILED CCCrypt: ' + e); }
+
+    S('iOS hooks installed -> ' + installed.join(', '));
 }
 """
+
+
+def script_src_for(platform: str) -> str:
+    return ANDROID_HOOKS if platform == "android" else IOS_HOOKS
 
 
 def run_dynamic(platform: str, target: str, host: Optional[str] = None,
@@ -1318,33 +1367,88 @@ def run_dynamic(platform: str, target: str, host: Optional[str] = None,
             elif p.get("t") == "status":
                 print(f"[DYN] {p.get('msg')}")
         elif message.get("type") == "error":
-            print(f"[DYN][frida-error] {message.get('description')}", file=sys.stderr)
+            print(f"[DYN][frida-script-error] {message.get('description')}", file=sys.stderr)
+            if message.get("stack"):
+                print(f"[DYN][stack] {message.get('stack')}", file=sys.stderr)
 
+    # ---- Acquire device ----
     try:
-        device = (frida.get_device_manager().add_remote_device(host) if host
-                  else frida.get_usb_device(timeout=10))
+        if host:
+            print(f"[DYN] connecting to remote device @ {host}")
+            device = frida.get_device_manager().add_remote_device(host)
+        else:
+            print("[DYN] connecting to local USB/adb device")
+            device = frida.get_usb_device(timeout=10)
+        print(f"[DYN] device: {device}")
     except Exception as e:
         print(f"[DYN] error: could not get device: {e}", file=sys.stderr)
+        print("[DYN] hint: is frida-server running on the device? "
+              "For local adb: 'adb shell \"su -c /data/local/tmp/frida-server &\"'", file=sys.stderr)
         return []
 
-    script_src = ANDROID_HOOKS if platform == "android" else IOS_HOOKS
+    # ---- Prove the connection by enumerating processes ----
     try:
-        if spawn:
+        procs = device.enumerate_processes()
+        print(f"[DYN] device reachable -- {len(procs)} processes visible.")
+    except Exception as e:
+        print(f"[DYN] error: connected to device but cannot enumerate processes: {e}", file=sys.stderr)
+        print("[DYN] this almost always means a frida client<->server VERSION MISMATCH "
+              "or frida-server crashed. Compare 'frida --version' with the on-device "
+              "'frida-server --version'.", file=sys.stderr)
+        return []
+
+    session = None
+
+    # ---- SPAWN path ----
+    if spawn:
+        try:
+            print(f"[DYN] spawning: {target}")
             pid = device.spawn([target])
             session = device.attach(pid)
-            script = session.create_script(script_src)
+            script = session.create_script(script_src_for(platform))
             script.on("message", on_message)
             script.load()
             device.resume(pid)
-        else:
-            session = device.attach(target)
-            script = session.create_script(script_src)
+            print(f"[DYN] spawned pid={pid} and resumed.")
+        except Exception as e:
+            print(f"[DYN] spawn failed for '{target}': {e}", file=sys.stderr)
+            print("[DYN] falling back to ATTACH (launch the app manually now if not running)...",
+                  file=sys.stderr)
+            session = None
+
+    # ---- ATTACH path (explicit, or spawn fallback) ----
+    if session is None:
+        attach_target = target
+        try:
+            matches = [p for p in device.enumerate_processes()
+                       if target.lower() in p.name.lower()]
+            if matches:
+                attach_target = matches[0].pid
+                print(f"[DYN] attaching to '{matches[0].name}' (pid={matches[0].pid})")
+            else:
+                print(f"[DYN] no running process matches '{target}'. "
+                      "Launch the app on the device first.", file=sys.stderr)
+                print("[DYN] processes currently running:", file=sys.stderr)
+                for p in sorted(device.enumerate_processes(), key=lambda x: x.name.lower())[:40]:
+                    print(f"        {p.pid:>6}  {p.name}", file=sys.stderr)
+                return collected
+        except Exception as e:
+            print(f"[DYN] could not enumerate for attach: {e}", file=sys.stderr)
+
+        try:
+            session = device.attach(attach_target)
+            script = session.create_script(script_src_for(platform))
             script.on("message", on_message)
             script.load()
-    except Exception as e:
-        print(f"[DYN] error: could not attach/spawn '{target}': {e}", file=sys.stderr)
-        return collected
+            print(f"[DYN] attached to {attach_target}.")
+        except Exception as e:
+            print(f"[DYN] attach failed for '{attach_target}': {e}", file=sys.stderr)
+            print("[DYN] if this is 'connection forcibly closed': version mismatch, "
+                  "frida-server crashed, or the app has anti-Frida that killed the session.",
+                  file=sys.stderr)
+            return collected
 
+    # ---- Instrument ----
     print(f"[DYN] Instrumenting for {duration}s -- EXERCISE THE APP NOW "
           f"(log in, navigate, submit forms) to trigger code paths.")
     try:
@@ -1554,7 +1658,7 @@ def run_validation(findings: List[Finding], engine: ValidationEngine) -> List[Fi
 
 
 def main():
-    ap = argparse.ArgumentParser(description="APK/IPA vulnerability scanner v4 (static + dynamic).")
+    ap = argparse.ArgumentParser(description="APK/IPA vulnerability scanner v4.1 (static + dynamic).")
     ap.add_argument("target", help="Path to .apk or .ipa file")
     ap.add_argument("--format", choices=["console", "text", "json", "word"],
                     default="console", help="Output format (default: console)")
@@ -1569,7 +1673,8 @@ def main():
     # dynamic
     ap.add_argument("--dynamic", action="store_true", help="Run Frida dynamic analysis")
     ap.add_argument("--dyn-target", help="package id (Android) / app name (iOS) for dynamic run")
-    ap.add_argument("--dyn-host", help="remote frida host (e.g. Corellium device IP)")
+    ap.add_argument("--dyn-host", help="remote frida host (e.g. Corellium device IP). "
+                                       "OMIT for local USB/adb.")
     ap.add_argument("--dyn-attach", action="store_true", help="attach instead of spawn")
     ap.add_argument("--dyn-duration", type=int, default=30, help="dynamic instrumentation seconds")
     args = ap.parse_args()
